@@ -56,8 +56,34 @@ def auth(x_worker_secret: str | None = Header(None)):
     if not expected or x_worker_secret != expected: raise HTTPException(401, 'Unauthorized')
 
 def validate_key(value: str):
-    if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+', value): raise ValueError('Enter an Upstox instrument_key, for example NSE_EQ|INE002A01018')
+    if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+|[A-Za-z0-9&_.-]{1,50}', value): raise ValueError('Enter an NSE ticker such as RELIANCE or an Upstox instrument key such as NSE_EQ|INE002A01018')
     return value
+
+async def resolve_instruments(values: list[str]):
+    resolved = []
+    token = os.environ.get('UPSTOX_ACCESS_TOKEN')
+    async with httpx.AsyncClient(timeout=20) as client:
+        for value in values:
+            if '|' in value:
+                resolved.append(value)
+                continue
+            if not token: raise HTTPException(400, 'UPSTOX_ACCESS_TOKEN is missing on the worker')
+            symbol = value.upper()
+            try:
+                response = await client.get('https://api.upstox.com/v2/instruments/search',
+                    params={'query': symbol, 'exchanges': 'NSE', 'segments': 'EQ', 'records': 30},
+                    headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+            except httpx.RequestError as exc:
+                raise HTTPException(502, f'Upstox instrument lookup failed for {symbol}: {exc.__class__.__name__}') from exc
+            if response.status_code == 401: raise HTTPException(400, 'Upstox access token expired or invalid. Update UPSTOX_ACCESS_TOKEN on Railway.')
+            if response.status_code != 200: raise HTTPException(502, f'Upstox instrument lookup failed for {symbol} (HTTP {response.status_code})')
+            matches = [item['instrument_key'] for item in response.json().get('data', [])
+                if item.get('segment') == 'NSE_EQ' and item.get('trading_symbol', '').upper() == symbol and item.get('instrument_key')]
+            matches = list(dict.fromkeys(matches))
+            if not matches: raise HTTPException(400, f'No exact NSE equity ticker found for {symbol}. Enter an Upstox instrument key for other instruments.')
+            if len(matches) > 1: raise HTTPException(400, f'Multiple NSE equities match {symbol}. Enter the specific Upstox instrument key.')
+            resolved.append(matches[0])
+    return list(dict.fromkeys(resolved))
 
 class Backfill(BaseModel):
     instruments: list[str] = Field(min_length=1, max_length=1000)
@@ -131,6 +157,7 @@ def submit(kind, payload):
 @app.post('/backfill', dependencies=[Depends(auth)])
 async def backfill(body: Backfill):
     if body.from_date > body.to_date or body.to_date > datetime.now(IST).date(): raise HTTPException(400, 'Invalid date range')
+    body.instruments = await resolve_instruments(body.instruments)
     return submit('backfill', body.model_dump(mode='json'))
 
 @app.post('/backtests', dependencies=[Depends(auth)])
@@ -138,6 +165,7 @@ async def backtests(body: Backtest):
     if body.interval not in INTERVALS or body.strategy not in ('dip_buy','sma_cross'): raise HTTPException(400, 'Unknown interval or strategy')
     if body.from_date > body.to_date or body.to_date > datetime.now(IST).date(): raise HTTPException(400, 'Invalid date range')
     if body.fast >= body.slow: raise HTTPException(400, 'Fast SMA must be shorter than slow SMA')
+    body.instruments = await resolve_instruments(body.instruments)
     return submit('backtest', body.model_dump(mode='json'))
 
 @app.get('/jobs/{job_id}', dependencies=[Depends(auth)])
