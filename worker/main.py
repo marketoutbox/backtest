@@ -160,7 +160,7 @@ def symbols():
                             params={'query': key.split('|', 1)[1], 'exchanges': 'NSE', 'segments': 'EQ', 'records': 30},
                             headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
                         if response.status_code == 200:
-                            match = next((item for item in response.json().get('data', []) if item.get('instrument_key') == key), None)
+                            match = next((item for item in response.json().get('data', []) if str(item.get('instrument_key', '')).upper() == key.upper()), None)
                             if match and match.get('trading_symbol'):
                                 conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (key, match['trading_symbol']))
                     except (httpx.RequestError, ValueError): pass
