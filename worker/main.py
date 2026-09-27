@@ -1,5 +1,6 @@
 """Persistent Upstox candle importer and bar-based backtest API."""
 import asyncio
+import csv
 import io
 import hashlib
 from pathlib import Path
@@ -17,6 +18,7 @@ import httpx
 import polars as pl
 import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 IST = ZoneInfo('Asia/Kolkata')
@@ -59,7 +61,7 @@ def validate_key(value: str):
     if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+|[A-Za-z0-9&_.-]{1,50}', value): raise ValueError('Enter an NSE ticker such as RELIANCE or an Upstox instrument key such as NSE_EQ|INE002A01018')
     return value
 
-async def resolve_instruments(values: list[str]):
+async def resolve_instruments(values: list[str], names: dict[str, str] | None = None):
     resolved = []
     token = os.environ.get('UPSTOX_ACCESS_TOKEN')
     async with httpx.AsyncClient(timeout=20) as client:
@@ -82,6 +84,7 @@ async def resolve_instruments(values: list[str]):
             matches = list(dict.fromkeys(matches))
             if not matches: raise HTTPException(400, f'No exact NSE equity ticker found for {symbol}. Enter an Upstox instrument key for other instruments.')
             if len(matches) > 1: raise HTTPException(400, f'Multiple NSE equities match {symbol}. Enter the specific Upstox instrument key.')
+            if names is not None: names[matches[0]] = symbol
             resolved.append(matches[0])
     return list(dict.fromkeys(resolved))
 
@@ -90,6 +93,7 @@ class Backfill(BaseModel):
     intervals: list[str] = Field(min_length=1)
     from_date: date
     to_date: date
+    refresh_existing: bool = False
     @field_validator('instruments')
     @classmethod
     def keys(cls, values): return list(dict.fromkeys(validate_key(s.strip()) for s in values))
@@ -118,6 +122,7 @@ class Backtest(BaseModel):
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS jobs (id text PRIMARY KEY, kind text NOT NULL, status text NOT NULL, payload jsonb NOT NULL, result jsonb, error text, progress integer NOT NULL DEFAULT 0, total integer NOT NULL DEFAULT 0, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS coverage (instrument text NOT NULL, interval text NOT NULL, from_date date NOT NULL, to_date date NOT NULL, rows integer NOT NULL, object_key text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (instrument, interval, from_date, to_date));
+CREATE TABLE IF NOT EXISTS instrument_names (instrument text PRIMARY KEY, symbol text NOT NULL);
 '''
 
 @app.on_event('startup')
@@ -144,8 +149,37 @@ def status():
 @app.get('/symbols', dependencies=[Depends(auth)])
 def symbols():
     with db() as conn:
-        rows = conn.execute('SELECT instrument, interval, min(from_date), max(to_date), sum(rows) FROM coverage GROUP BY instrument, interval ORDER BY instrument, interval').fetchall()
-    return {'symbols': [{'instrument': a, 'interval': b, 'from_date': str(c), 'to_date': str(d), 'candles': e} for a,b,c,d,e in rows]}
+        missing = conn.execute('SELECT DISTINCT c.instrument FROM coverage c LEFT JOIN instrument_names n ON n.instrument=c.instrument WHERE n.instrument IS NULL LIMIT 10').fetchall()
+        token = os.environ.get('UPSTOX_ACCESS_TOKEN')
+        if token and missing:
+            with httpx.Client(timeout=6) as client:
+                for (key,) in missing:
+                    if not key.startswith('NSE_EQ|'): continue
+                    try:
+                        response = client.get('https://api.upstox.com/v2/instruments/search',
+                            params={'query': key.split('|', 1)[1], 'exchanges': 'NSE', 'segments': 'EQ', 'records': 30},
+                            headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+                        if response.status_code == 200:
+                            match = next((item for item in response.json().get('data', []) if item.get('instrument_key') == key), None)
+                            if match and match.get('trading_symbol'):
+                                conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (key, match['trading_symbol']))
+                    except (httpx.RequestError, ValueError): pass
+        rows = conn.execute('SELECT c.instrument, c.interval, min(c.from_date), max(c.to_date), sum(c.rows), count(*), n.symbol FROM coverage c LEFT JOIN instrument_names n ON n.instrument=c.instrument GROUP BY c.instrument,c.interval,n.symbol ORDER BY coalesce(n.symbol,c.instrument),c.interval').fetchall()
+    return {'symbols': [{'instrument': a, 'interval': b, 'from_date': str(c), 'to_date': str(d), 'candles': e, 'windows': w, 'symbol': name or a} for a,b,c,d,e,w,name in rows]}
+
+class InstrumentLabel(BaseModel):
+    instrument: str
+    symbol: str
+
+@app.post('/instrument/label', dependencies=[Depends(auth)])
+def set_instrument_label(body: InstrumentLabel):
+    symbol = body.symbol.strip().upper()
+    if not re.fullmatch(r'[A-Z0-9&_.-]{1,50}', symbol): raise HTTPException(400, 'Enter a valid ticker name')
+    with db() as conn:
+        if not conn.execute('SELECT 1 FROM coverage WHERE instrument=%s LIMIT 1', (body.instrument,)).fetchone():
+            raise HTTPException(404, 'Instrument not found in archive')
+        conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (body.instrument, symbol))
+    return {'instrument': body.instrument, 'symbol': symbol}
 
 def submit(kind, payload):
     job_id = str(uuid.uuid4())
@@ -157,7 +191,11 @@ def submit(kind, payload):
 @app.post('/backfill', dependencies=[Depends(auth)])
 async def backfill(body: Backfill):
     if body.from_date > body.to_date or body.to_date > datetime.now(IST).date(): raise HTTPException(400, 'Invalid date range')
-    body.instruments = await resolve_instruments(body.instruments)
+    names = {}
+    body.instruments = await resolve_instruments(body.instruments, names)
+    with db() as conn:
+        for key, label in names.items():
+            conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (key, label))
     return submit('backfill', body.model_dump(mode='json'))
 
 @app.post('/backtests', dependencies=[Depends(auth)])
@@ -267,6 +305,7 @@ def write_window(instrument, interval, begin, end, candles):
             temporary.replace(path)
         else:
             storage().put_object(Bucket=bucket(), Key=key, Body=buf.getvalue())
+            (Path(os.environ.get('CACHE_DIR', '/tmp/backtest-parquet-cache')) / (hashlib.sha256(key.encode()).hexdigest() + '.parquet')).unlink(missing_ok=True)
     with db() as conn:
         conn.execute('INSERT INTO coverage (instrument,interval,from_date,to_date,rows,object_key) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (instrument,interval,from_date,to_date) DO UPDATE SET rows=excluded.rows, object_key=excluded.object_key, updated_at=now()', (instrument,interval,begin,end,len(records),key))
     return len(records)
@@ -281,7 +320,7 @@ async def ingest(job_id, payload):
         for key, period, a, b in tasks:
             with db() as conn:
                 exists = conn.execute('SELECT rows FROM coverage WHERE instrument=%s AND interval=%s AND from_date=%s AND to_date=%s', (key,period,a,b)).fetchone()
-            if exists is not None: skipped += 1
+            if exists is not None and not payload.get('refresh_existing'): skipped += 1
             else:
                 try:
                     candles = await upstox(client,key,period,a,b)
@@ -311,12 +350,39 @@ def load_candles(instrument, interval, begin, end):
     if not frames: return None
     return pl.concat(frames).filter(pl.col('session_date').is_between(begin,end)).unique(subset=['ts'], keep='last').sort('ts')
 
-@app.get('/candles', dependencies=[Depends(auth)])
-def candles(instrument: str, interval: str, from_date: date, to_date: date,
-            page: int = Query(1, ge=1), limit: int = Query(100, ge=1, le=250)):
+class DeleteArchive(BaseModel):
+    instrument: str
+
+@app.post('/archive/delete', dependencies=[Depends(auth)])
+def delete_archive(body: DeleteArchive):
+    if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+', body.instrument): raise HTTPException(400, 'Select an archived instrument')
+    with db() as conn:
+        active = conn.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') AND payload->'instruments' ? %s LIMIT 1", (body.instrument,)).fetchone()
+        if active: raise HTTPException(409, 'A job is using this symbol. Wait until it finishes before deleting.')
+        keys = [row[0] for row in conn.execute('SELECT object_key FROM coverage WHERE instrument=%s', (body.instrument,)).fetchall()]
+        if not keys: raise HTTPException(404, 'No archive found for this instrument')
+        with_files = [key for key in keys if archive_path(key) is not None]
+        for key in with_files: archive_path(key).unlink(missing_ok=True)
+        remote = [key for key in keys if key not in with_files]
+        for i in range(0, len(remote), 1000):
+            response = storage().delete_objects(Bucket=bucket(), Delete={'Objects': [{'Key': key} for key in remote[i:i+1000]], 'Quiet': True})
+            if response.get('Errors'): raise HTTPException(502, 'Storage could not delete every archive file. Retry deletion.')
+        cache_root = Path(os.environ.get('CACHE_DIR', '/tmp/backtest-parquet-cache'))
+        for key in keys:
+            (cache_root / (hashlib.sha256(key.encode()).hexdigest() + '.parquet')).unlink(missing_ok=True)
+        conn.execute('DELETE FROM coverage WHERE instrument=%s', (body.instrument,))
+        conn.execute('DELETE FROM instrument_names WHERE instrument=%s', (body.instrument,))
+    return {'deleted_windows': len(keys), 'instrument': body.instrument}
+
+def validate_candle_query(instrument, interval, from_date, to_date):
     if interval not in INTERVALS: raise HTTPException(400, 'Unknown interval')
     if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+', instrument): raise HTTPException(400, 'Select an archived instrument')
     if from_date > to_date or (to_date - from_date).days > 31: raise HTTPException(400, 'Select a date range of at most 31 days')
+
+@app.get('/candles', dependencies=[Depends(auth)])
+def candles(instrument: str, interval: str, from_date: date, to_date: date,
+            page: int = Query(1, ge=1), limit: int = Query(100, ge=1, le=250)):
+    validate_candle_query(instrument, interval, from_date, to_date)
     if page > 10000: raise HTTPException(400, 'Page is too large')
     frame = load_candles(instrument, interval, from_date, to_date)
     if frame is None: return {'rows': [], 'total': 0, 'page': page, 'limit': limit}
@@ -324,6 +390,19 @@ def candles(instrument: str, interval: str, from_date: date, to_date: date,
     rows = frame.sort('ts', descending=True).slice((page - 1) * limit, limit).to_dicts()
     return {'rows': [{**row, 'ts': row['ts'].astimezone(IST).isoformat(), 'session_date': row['session_date'].isoformat()} for row in rows],
             'total': total, 'page': page, 'limit': limit}
+
+@app.get('/candles/export', dependencies=[Depends(auth)])
+def export_candles(instrument: str, interval: str, from_date: date, to_date: date):
+    validate_candle_query(instrument, interval, from_date, to_date)
+    frame = load_candles(instrument, interval, from_date, to_date)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['timestamp_ist', 'open', 'high', 'low', 'close', 'volume', 'open_interest'])
+    if frame is not None:
+        for row in frame.iter_rows(named=True):
+            writer.writerow([row['ts'].astimezone(IST).isoformat(), row['open'], row['high'], row['low'], row['close'], row['volume'], row['open_interest']])
+    output.seek(0)
+    return StreamingResponse(iter([output.getvalue()]), media_type='text/csv')
 
 def simulate(frame, instrument, config):
     """Signals on completed bar, enter next bar open, conservative stop-first ambiguous fills."""
