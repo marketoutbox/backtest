@@ -1,0 +1,15 @@
+node_modules
+.next
+.env*
+!.env.example
+__pycache__
+*.pyc
+.pytest_cache
+.venv
+*.db
+*.duckdb
+*.parquet
+coverage
+!.env.worker.example
+
+*.tsbuildinfo
