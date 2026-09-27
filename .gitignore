@@ -11,5 +11,6 @@ __pycache__
 *.parquet
 coverage
 !.env.worker.example
+!.env.oracle.example
 
 *.tsbuildinfo

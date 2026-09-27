@@ -12,6 +12,26 @@ Private Next.js control panel on Vercel, backed by a persistent Python importer 
 
 ## Deploy
 
+### Oracle Always Free VM
+
+The repository includes `compose.oracle.yml` for a single ARM Ubuntu VM. It runs Postgres and the worker on the VM and keeps Parquet, database files, and TLS state under `/srv/backtest`. No S3 account is needed in this mode. Select the **VM.Standard.A1.Flex Always Free** shape with at most 2 OCPUs and 12 GB RAM, and an Ubuntu ARM image. Allocate an appropriately sized boot volume within the account's Always Free allowance. Assign a public IPv4 address and allow TCP 80/443 in the VM network security list; restrict SSH 22 to your own IP. Keep 5432 and 8080 closed publicly.
+
+On the VM, install Docker Engine and its Compose plugin from Docker's official Ubuntu repository, clone the private repo using your own GitHub access, then:
+
+```sh
+sudo mkdir -p /srv/backtest/{postgres,archive,caddy}
+sudo chown -R "$USER":"$USER" /srv/backtest
+cp .env.oracle.example .env.oracle
+openssl rand -hex 32  # use for POSTGRES_PASSWORD
+openssl rand -hex 32  # use a different value for WORKER_SECRET
+```
+
+Edit `.env.oracle` on the VM. Set `SITE_HOST` to a DNS name pointing at its public IP, and set the server-side Upstox token. Then run `docker compose --env-file .env.oracle -f compose.oracle.yml up -d --build`. Caddy obtains HTTPS once DNS and ports 80/443 work. Check `docker compose --env-file .env.oracle -f compose.oracle.yml logs --tail=100 worker gateway` and `curl -i https://YOUR_HOST/status` (401 without the secret is expected). Add `WORKER_URL=https://YOUR_HOST` and the same `WORKER_SECRET` to Vercel's Production and Preview environment variables and redeploy. The Vercel site remains behind Vercel Authentication. Do not commit `.env.oracle`, share the token in chat, or expose the database port.
+
+The single VM is a practical starting point for several GB; it is not a benchmarked guarantee for every universe and strategy. Take separate backups of `/srv/backtest/postgres` and `/srv/backtest/archive`, and monitor free disk space. The Upstox token must be refreshed when it expires.
+
+### Other worker hosts
+
 1. Import the private `marketoutbox/backtest` repository in Vercel as a Next.js project. The root directory is the repository root.
 2. Provision a PostgreSQL database and a private S3-compatible bucket. Deploy `worker/` as a persistent Docker service (for example a VM or managed container with an always-on process), reachable by Vercel. The worker is a separate service: Vercel alone does not run the long backfill jobs.
 3. Copy `.env.worker.example` values into the worker service. Supply a server-side Upstox access token and `WORKER_SECRET`. Create the bucket before starting the worker.

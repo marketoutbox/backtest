@@ -1,0 +1,4 @@
+{$SITE_HOST} {
+    encode zstd gzip
+    reverse_proxy worker:8080
+}

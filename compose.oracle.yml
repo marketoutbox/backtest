@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: backtest
+      POSTGRES_USER: backtest
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - /srv/backtest/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U backtest -d backtest"]
+      interval: 5s
+      retries: 12
+
+  worker:
+    build: ./worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://backtest:${POSTGRES_PASSWORD}@postgres:5432/backtest
+      ARCHIVE_DIR: /data/parquet
+      CACHE_DIR: /data/cache
+      UPSTOX_ACCESS_TOKEN: ${UPSTOX_ACCESS_TOKEN:?Set UPSTOX_ACCESS_TOKEN}
+      WORKER_SECRET: ${WORKER_SECRET:?Set WORKER_SECRET}
+      MAX_REQUESTS_PER_MINUTE: 60
+    volumes:
+      - /srv/backtest/archive:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  gateway:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      SITE_HOST: ${SITE_HOST:?Set SITE_HOST}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile.oracle:/etc/caddy/Caddyfile:ro
+      - /srv/backtest/caddy:/data
+    depends_on:
+      - worker

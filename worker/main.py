@@ -43,6 +43,14 @@ def bucket():
     if not value: raise RuntimeError('S3_BUCKET is required')
     return value
 
+def archive_path(key):
+    root = os.environ.get('ARCHIVE_DIR')
+    if not root: return None
+    base = Path(root).resolve()
+    path = (base / key).resolve()
+    if not path.is_relative_to(base): raise ValueError('Invalid archive key')
+    return path
+
 def auth(x_worker_secret: str | None = Header(None)):
     expected = os.environ.get('WORKER_SECRET')
     if not expected or x_worker_secret != expected: raise HTTPException(401, 'Unauthorized')
@@ -214,7 +222,14 @@ def write_window(instrument, interval, begin, end, candles):
         frame = pl.DataFrame(records, schema=['ts','session_date','open','high','low','close','volume','open_interest'], orient='row')
         buf = io.BytesIO()
         frame.write_parquet(buf, compression='zstd')
-        storage().put_object(Bucket=bucket(), Key=key, Body=buf.getvalue())
+        path = archive_path(key)
+        if path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix('.tmp-' + uuid.uuid4().hex)
+            temporary.write_bytes(buf.getvalue())
+            temporary.replace(path)
+        else:
+            storage().put_object(Bucket=bucket(), Key=key, Body=buf.getvalue())
     with db() as conn:
         conn.execute('INSERT INTO coverage (instrument,interval,from_date,to_date,rows,object_key) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (instrument,interval,from_date,to_date) DO UPDATE SET rows=excluded.rows, object_key=excluded.object_key, updated_at=now()', (instrument,interval,begin,end,len(records),key))
     return len(records)
@@ -242,7 +257,9 @@ def load_candles(instrument, interval, begin, end):
     cache_root = Path(os.environ.get('CACHE_DIR', '/tmp/backtest-parquet-cache'))
     cache_root.mkdir(parents=True, exist_ok=True)
     for (key,) in rows:
-        cached = cache_root / (hashlib.sha256(key.encode()).hexdigest() + '.parquet')
+        local = archive_path(key)
+        cached = local or cache_root / (hashlib.sha256(key.encode()).hexdigest() + '.parquet')
+        if local and not local.exists(): raise FileNotFoundError(f'Archive missing: {key}')
         if not cached.exists():
             obj = storage().get_object(Bucket=bucket(), Key=key)
             temporary = cached.with_suffix('.tmp-' + uuid.uuid4().hex)
