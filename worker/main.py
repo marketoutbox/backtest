@@ -16,7 +16,7 @@ import boto3
 import httpx
 import polars as pl
 import psycopg
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 IST = ZoneInfo('Asia/Kolkata')
@@ -310,6 +310,20 @@ def load_candles(instrument, interval, begin, end):
         frames.append(pl.read_parquet(cached))
     if not frames: return None
     return pl.concat(frames).filter(pl.col('session_date').is_between(begin,end)).unique(subset=['ts'], keep='last').sort('ts')
+
+@app.get('/candles', dependencies=[Depends(auth)])
+def candles(instrument: str, interval: str, from_date: date, to_date: date,
+            page: int = Query(1, ge=1), limit: int = Query(100, ge=1, le=250)):
+    if interval not in INTERVALS: raise HTTPException(400, 'Unknown interval')
+    if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+', instrument): raise HTTPException(400, 'Select an archived instrument')
+    if from_date > to_date or (to_date - from_date).days > 31: raise HTTPException(400, 'Select a date range of at most 31 days')
+    if page > 10000: raise HTTPException(400, 'Page is too large')
+    frame = load_candles(instrument, interval, from_date, to_date)
+    if frame is None: return {'rows': [], 'total': 0, 'page': page, 'limit': limit}
+    total = frame.height
+    rows = frame.sort('ts', descending=True).slice((page - 1) * limit, limit).to_dicts()
+    return {'rows': [{**row, 'ts': row['ts'].astimezone(IST).isoformat(), 'session_date': row['session_date'].isoformat()} for row in rows],
+            'total': total, 'page': page, 'limit': limit}
 
 def simulate(frame, instrument, config):
     """Signals on completed bar, enter next bar open, conservative stop-first ambiguous fills."""
