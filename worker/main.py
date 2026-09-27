@@ -193,7 +193,7 @@ async def run_queue():
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            update(job_id, status='failed', error=str(exc)[:1000])
+            update(job_id, status='failed', error=(str(exc) or exc.__class__.__name__)[:1000])
         finally:
             queue.task_done()
 
@@ -222,16 +222,25 @@ def windows(first: date, last: date, span: int):
 async def upstox(client, instrument, interval, begin, end):
     unit, number, _ = INTERVALS[interval]
     url = f'https://api.upstox.com/v3/historical-candle/{quote(instrument, safe="")}/{unit}/{number}/{end}/{begin}'
+    last_error = None
     for retry in range(6):
         await throttle()
-        response = await client.get(url, headers={'Authorization': f'Bearer {os.environ.get("UPSTOX_ACCESS_TOKEN", "")}', 'Accept': 'application/json'})
+        try:
+            response = await client.get(url, headers={'Authorization': f'Bearer {os.environ.get("UPSTOX_ACCESS_TOKEN", "")}', 'Accept': 'application/json'})
+        except httpx.RequestError as exc:
+            last_error = exc.__class__.__name__
+            if retry < 5: await asyncio.sleep(min(2 ** retry, 30))
+            continue
         if response.status_code in (429, 500, 502, 503, 504):
-            await asyncio.sleep(min(2 ** retry, 30)); continue
-        response.raise_for_status()
+            last_error = f'HTTP {response.status_code}'
+            if retry < 5: await asyncio.sleep(min(2 ** retry, 30))
+            continue
+        if response.status_code == 401: raise RuntimeError('Upstox access token expired or invalid. Update UPSTOX_ACCESS_TOKEN on Railway.')
+        if response.status_code >= 400: raise RuntimeError(f'Upstox returned HTTP {response.status_code}: {response.text[:300]}')
         data = response.json()
         if data.get('status') != 'success': raise RuntimeError(str(data)[:400])
         return data['data']['candles']
-    raise RuntimeError(f'Upstox retries exhausted: {instrument} {interval} {begin}..{end}')
+    raise RuntimeError(f'Upstox retries exhausted ({last_error}): {instrument} {interval} {begin}..{end}')
 
 def object_key(instrument, interval, begin, end):
     safe = instrument.replace('|', '_').replace(' ', '_')
@@ -273,7 +282,12 @@ async def ingest(job_id, payload):
             with db() as conn:
                 exists = conn.execute('SELECT rows FROM coverage WHERE instrument=%s AND interval=%s AND from_date=%s AND to_date=%s', (key,period,a,b)).fetchone()
             if exists is not None: skipped += 1
-            else: count += await asyncio.to_thread(write_window, key, period, a, b, await upstox(client,key,period,a,b))
+            else:
+                try:
+                    candles = await upstox(client,key,period,a,b)
+                    count += await asyncio.to_thread(write_window, key, period, a, b, candles)
+                except Exception as exc:
+                    raise RuntimeError(f'Import failed for {key} {period} {a} to {b}: {str(exc) or exc.__class__.__name__}') from exc
             completed += 1
             update(job_id, progress=completed)
     return {'candles_added':count, 'windows_skipped':skipped, 'windows_total':len(tasks)}
