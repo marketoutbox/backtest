@@ -572,7 +572,7 @@ def validate_candle_query(instrument, interval, from_date, to_date, max_days=Non
     if interval not in INTERVALS: raise HTTPException(400, 'Unknown interval')
     if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+', instrument): raise HTTPException(400, 'Select an archived instrument')
     if from_date > to_date: raise HTTPException(400, 'FROM must be on or before TO')
-    if max_days is not None and (to_date - from_date).days > max_days: raise HTTPException(400, f'CSV export supports at most {max_days + 1} days at a time')
+    if max_days is not None and (to_date - from_date).days > max_days: raise HTTPException(400, f'Export batch supports at most {max_days + 1} days')
 
 @app.get('/candles', dependencies=[Depends(auth)])
 def candles(instrument: str, interval: str, from_date: date, to_date: date,
@@ -614,12 +614,12 @@ def candles(instrument: str, interval: str, from_date: date, to_date: date,
             'has_more': has_more, 'next_cursor': rows[-1]['ts'].isoformat() if has_more else None, 'limit': limit}
 
 @app.get('/candles/export', dependencies=[Depends(auth)])
-def export_candles(instrument: str, interval: str, from_date: date, to_date: date):
-    validate_candle_query(instrument, interval, from_date, to_date, max_days=30)
+def export_candles(instrument: str, interval: str, from_date: date, to_date: date, include_header: bool = True):
+    validate_candle_query(instrument, interval, from_date, to_date, max_days=27)
     frame = load_candles(instrument, interval, from_date, to_date)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(['timestamp_ist', 'open', 'high', 'low', 'close', 'volume', 'open_interest'])
+    if include_header: writer.writerow(['timestamp_ist', 'open', 'high', 'low', 'close', 'volume', 'open_interest'])
     if frame is not None:
         for row in frame.iter_rows(named=True):
             writer.writerow([row['ts'].astimezone(IST).isoformat(), row['open'], row['high'], row['low'], row['close'], row['volume'], row['open_interest']])

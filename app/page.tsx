@@ -46,7 +46,7 @@ function CandleViewer({coverage, active, initialInstrument, refresh, onJob}: {co
  const effectiveStart=start||first;const effectiveEnd=end||last;
  const viewStart=appliedStart||first;const viewEnd=appliedEnd||last;
  const validRange=!!effectiveStart&&!!effectiveEnd&&effectiveStart<=effectiveEnd;
- const exportAllowed=validRange&&(Date.parse(effectiveEnd)-Date.parse(effectiveStart))/86400000<=30;
+ const [exportProgress,setExportProgress]=useState('');
  useEffect(()=>{if(!active)return;const timer=setInterval(()=>setTick(value=>value+1),10000);return()=>clearInterval(timer)},[active]);
  useEffect(()=>{if(!current||!currentInterval||!viewStart||!viewEnd||viewStart>viewEnd){setResult(null);return}let cancelled=false;setLoading(true);setError('');
   const params=new URLSearchParams({instrument:current,interval:currentInterval,from_date:viewStart,to_date:viewEnd,limit:'100'});if(cursors[page-1])params.set('cursor',cursors[page-1]!);
@@ -57,9 +57,29 @@ function CandleViewer({coverage, active, initialInstrument, refresh, onJob}: {co
  const changeInterval=(value:string)=>{setTimeframe(value);setStart('');setEnd('');setAppliedStart('');setAppliedEnd('');setPage(1);setCursors([null])};
  function applyRange(from=effectiveStart,to=effectiveEnd){if(!from||!to||from>to){setError('FROM must be on or before TO.');return}setStart(from);setEnd(to);setAppliedStart(from);setAppliedEnd(to);setPage(1);setCursors([null]);setError('')}
  function recent(days:number){const to=last;const from=new Date(Math.max(Date.parse(first+'T00:00:00Z'),Date.parse(to+'T00:00:00Z')-(days-1)*86400000)).toISOString().slice(0,10);applyRange(from,to)}
- const params=new URLSearchParams({instrument:current,interval:currentInterval,from_date:effectiveStart,to_date:effectiveEnd});
-
- async function exportCsv(){setError('');if(!exportAllowed){setError('CSV export supports up to 31 days. Choose a shorter range.');return}setBusy(true);try{const response=await fetch(`/api/candles/export?${params}`,{cache:'no-store'});if(!response.ok){const body=await response.json();throw new Error(errorMessage(body.detail??body))}const blob=await response.blob();const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`${label}-${currentInterval}-${effectiveStart}-${effectiveEnd}.csv`;a.click();URL.revokeObjectURL(url)}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
+ async function exportCsv(){
+  setError('');setExportProgress('');if(!validRange){setError('Select a valid FROM and TO date.');return}
+  const picker=(window as Window & {showSaveFilePicker?:(options:unknown)=>Promise<{createWritable:()=>Promise<FileSystemWritableFileStream>}>}).showSaveFilePicker;
+  if(!picker){setError('Full-range CSV download needs Chrome or Edge on a secure site.');return}
+  let file:FileSystemWritableFileStream;
+  try{const handle=await picker({suggestedName:`${label}-${currentInterval}-${effectiveStart}-${effectiveEnd}.csv`,types:[{description:'CSV file',accept:{'text/csv':['.csv']}}]});file=await handle.createWritable()}
+  catch(e){if((e as DOMException).name!=='AbortError')setError((e as Error).message);return}
+  setBusy(true);let completed=false;
+  try{
+   const endDay=Date.parse(`${effectiveEnd}T00:00:00Z`);let day=Date.parse(`${effectiveStart}T00:00:00Z`);let part=0;
+   while(day<=endDay){const lastDay=Math.min(endDay,day+27*86400000);const from=new Date(day).toISOString().slice(0,10);const to=new Date(lastDay).toISOString().slice(0,10);
+    setExportProgress(`Downloading ${from} to ${to}…`);
+    const params=new URLSearchParams({instrument:current,interval:currentInterval,from_date:from,to_date:to,include_header:String(part===0)});
+    const response=await fetch(`/api/candles/export?${params}`,{cache:'no-store'});
+    if(!response.ok){const body=await response.json();throw new Error(errorMessage(body.detail??body))}
+    if(!response.body)throw new Error('Download stream unavailable.');
+    const reader=response.body.getReader();try{while(true){const {done,value}=await reader.read();if(done)break;await file.write(value)}}finally{reader.releaseLock()}
+    day=lastDay+86400000;part++;
+   }
+   await file.close();completed=true;setExportProgress('CSV download complete.');
+  }catch(e){setError(`CSV download stopped: ${(e as Error).message}`);setExportProgress('');}
+  finally{if(!completed)await file.abort().catch(()=>{});setBusy(false)}
+ }
  async function updateSelected(){if(!selected)return;setBusy(true);setError('');setMessage('');try{const queued=await api('backfill',{instruments:[current],intervals:[currentInterval],from_date:selected.from_date,to_date:today,refresh_existing:true});onJob({...queued,kind:'backfill',progress:0,total:0});setMessage(`Updating ${label} ${currentInterval}: refreshing archived windows through today.`)}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
  async function deleteSelected(){setBusy(true);setError('');setMessage('');try{const result=await api('archive/delete',{instrument:current});setConfirmDelete(false);setDeleteText('');setInstrument('');setResult(null);setAppliedStart('');setAppliedEnd('');setCursors([null]);await refresh();setMessage(`Deleted ${label} across all timeframes (${result.deleted_windows} stored windows).`)}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
  async function saveName(){setBusy(true);setError('');try{await api('instrument/label',{instrument:current,symbol:nameInput.trim()});await refresh();setEditingName(false);setMessage('Ticker label updated.')}catch(e){setError((e as Error).message)}finally{setBusy(false)}}
@@ -70,11 +90,11 @@ function CandleViewer({coverage, active, initialInstrument, refresh, onJob}: {co
   {editingName&&<div className="nameedit"><input aria-label="Ticker name" value={nameInput} onChange={event=>setNameInput(event.target.value)} placeholder="HCLTECH"/><button onClick={saveName} disabled={busy||!nameInput.trim()}>Save name</button><button className="plain" onClick={()=>setEditingName(false)}>Cancel</button></div>}
   <div className="viewerintervals">{available.map(value=><button key={value} className={`chip ${currentInterval===value?'chosen':''}`} onClick={()=>changeInterval(value)}>{value}</button>)}</div>
   <div className="viewerstats"><div><span>SELECTED CANDLES</span><strong>{(selected?.candles||0).toLocaleString()}</strong></div><div><span>STORED WINDOWS</span><strong>{selected?.windows||0}</strong></div><div><span>FIRST CANDLE</span><strong>{selected?.first_candle||(selected?.filled_windows?'Scanning…':'No candles')}</strong></div><div><span>LATEST CANDLE</span><strong>{selected?.last_candle||(selected?.filled_windows?'Scanning…':'No candles')}</strong></div></div>
-  <div className="vieweractions"><button onClick={exportCsv} disabled={busy||!exportAllowed}>Download CSV (up to 31 days)</button><button onClick={updateSelected} disabled={busy||active}>Update {label} · {currentInterval}</button><button className="deletebutton" onClick={()=>{setConfirmDelete(true);setDeleteText('')}} disabled={busy||active}>Delete {label} data</button></div>
+  <div className="vieweractions"><button onClick={exportCsv} disabled={busy||!validRange}>Download selected range CSV</button><button onClick={updateSelected} disabled={busy||active}>Update {label} · {currentInterval}</button><button className="deletebutton" onClick={()=>{setConfirmDelete(true);setDeleteText('')}} disabled={busy||active}>Delete {label} data</button></div>{exportProgress&&<p className="footnote" role="status">{exportProgress}</p>}
   {confirmDelete&&<div className="deleteconfirm"><strong>Delete all stored data for {label}?</strong><p>This removes every timeframe and its Parquet files. Type <b>{label}</b> to confirm.</p><div><input aria-label="Confirm symbol" value={deleteText} onChange={event=>setDeleteText(event.target.value)} placeholder={label}/><button className="deletebutton" disabled={busy||deleteText!==label} onClick={deleteSelected}>Delete all data</button><button className="plain" onClick={()=>setConfirmDelete(false)}>Cancel</button></div></div>}
   <div className="rowtitle">ARCHIVE BY TIMEFRAME <span>{selectedCoverage.reduce((sum,row)=>sum+row.candles,0).toLocaleString()} candles across {selectedCoverage.length} periods</span></div>
   <div className="tablewrap coveragebreakdown"><table><thead><tr><th>TIMEFRAME</th><th>FIRST PRICE DATE</th><th>LAST PRICE DATE</th><th>REQUESTED RANGE</th><th className="numeric">WINDOWS</th><th className="numeric">CANDLES</th><th></th></tr></thead><tbody>{selectedCoverage.map(row=><tr key={row.interval}><td><span className="period">{row.interval}</span></td><td>{row.first_candle||(row.filled_windows?'Scanning…':'No candles')}</td><td>{row.last_candle||(row.filled_windows?'Scanning…':'No candles')}</td><td>{row.from_date} → {row.to_date}</td><td className="numeric">{row.verified_windows}/{row.filled_windows} verified</td><td className="numeric">{row.candles.toLocaleString()}</td><td><button className="plain" onClick={()=>changeInterval(row.interval)}>View prices</button></td></tr>)}</tbody></table></div>
-  <p className="footnote">Minute data is fetched in 28 day API requests and stored across the full selected import range. Select any stored date range to view its prices. Rows load page by page; CSV export is limited to 31 days per file.</p>
+  <p className="footnote">Minute data is fetched in 28 day API requests and stored across the full selected import range. Select any stored date range to view or export. Full-range CSV writes directly to a file in Chrome or Edge; keep this tab open until complete.</p>
   <div className="rowtitle candleheading">PRICE ROWS <span>{viewStart} → {viewEnd} · {currentInterval} · newest first</span></div>
   <div className="rangecontrols"><div><button className="plain" onClick={()=>recent(7)}>7 days</button><button className="plain" onClick={()=>recent(31)}>1 month</button><button className="plain" onClick={()=>recent(365)}>1 year</button><button className="plain" onClick={()=>applyRange(first,last)}>All stored dates</button></div><button className="applyrange" onClick={()=>applyRange()} disabled={!validRange}>Apply date range</button></div>
   {!validRange&&<div className="alert danger">FROM must be on or before TO. Change either date, then click Apply date range.</div>}
