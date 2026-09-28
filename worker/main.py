@@ -100,7 +100,8 @@ async def resolve_instruments(values: list[str], names: dict[str, str] | None = 
     return list(dict.fromkeys(resolved))
 
 class Backfill(BaseModel):
-    instruments: list[str] = Field(min_length=1, max_length=1000)
+    instruments: list[str] = Field(default_factory=list, max_length=1000)
+    universe: str | None = None
     intervals: list[str] = Field(min_length=1)
     from_date: date
     to_date: date
@@ -139,6 +140,7 @@ ALTER TABLE api_tokens ALTER COLUMN expires_at DROP NOT NULL;
 ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS token_type text NOT NULL DEFAULT 'oauth';
 ALTER TABLE coverage ADD COLUMN IF NOT EXISTS first_candle date;
 ALTER TABLE coverage ADD COLUMN IF NOT EXISTS last_candle date;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS details jsonb NOT NULL DEFAULT '{}'::jsonb;
 '''
 
 @app.on_event('startup')
@@ -329,12 +331,31 @@ async def backfill(body: Backfill):
     if body.from_date > body.to_date or body.to_date > datetime.now(IST).date(): raise HTTPException(400, 'Invalid date range')
     if body.from_date < START and any(INTERVALS[p][0] in ('minutes','hours') for p in body.intervals):
         raise HTTPException(400, 'Upstox minute and hourly history starts in January 2022. Select 2022-01-01 or later for intraday imports.')
-    names = {}
-    body.instruments = await resolve_instruments(body.instruments, names)
+    if body.universe:
+        if body.universe != 'top100mc' or body.instruments: raise HTTPException(400, 'Choose the saved top100mc list or enter tickers')
+        body.instruments = [row['instrument_key'] for row in universe_rows()]
+        names = {}
+    else:
+        if not body.instruments: raise HTTPException(400, 'Add at least one ticker or choose top100mc')
+        names = {}
+        # Resolve small lists immediately; large lists are resolved inside the durable job.
+        if len(body.instruments) <= 10: body.instruments = await resolve_instruments(body.instruments, names)
     with db() as conn:
         for key, label in names.items():
             conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (key, label))
     return submit('backfill', body.model_dump(mode='json'))
+
+def universe_rows():
+    with (Path(__file__).parent / 'universes/top100mc.csv').open(newline='') as source:
+        return list(csv.DictReader(source))
+
+@app.get('/universes/top100mc', dependencies=[Depends(auth)])
+def top100mc():
+    rows = universe_rows()
+    return {'name': 'top100mc', 'count': len(rows), 'as_of': '2026-06-30',
+            'method': 'NSE six-month average total market capitalisation, AMFI Jan–Jun 2026',
+            'source': 'https://portal.amfiindia.com/spages/AverageMarketCapitalization30Jun2026.pdf',
+            'symbols': [row['symbol'] for row in rows]}
 
 @app.post('/backtests', dependencies=[Depends(auth)])
 async def backtests(body: Backtest):
@@ -347,15 +368,23 @@ async def backtests(body: Backtest):
 @app.get('/jobs/{job_id}', dependencies=[Depends(auth)])
 def job(job_id: str):
     with db() as conn:
-        row = conn.execute('SELECT id,kind,status,progress,total,result,error FROM jobs WHERE id=%s', (job_id,)).fetchone()
+        row = conn.execute('SELECT id,kind,status,progress,total,result,error,details FROM jobs WHERE id=%s', (job_id,)).fetchone()
     if row is None: raise HTTPException(404, 'Job not found')
-    return dict(zip(('id','kind','status','progress','total','result','error'), row))
+    return dict(zip(('id','kind','status','progress','total','result','error','details'), row))
+
+@app.post('/jobs/{job_id}/resume', dependencies=[Depends(auth)])
+def resume_job(job_id: str):
+    with db() as conn:
+        row = conn.execute("UPDATE jobs SET status='queued',error=NULL,updated_at=now() WHERE id=%s AND kind='backfill' AND status IN ('failed','partial') RETURNING id", (job_id,)).fetchone()
+    if not row: raise HTTPException(409, 'Only a failed or partial import can be resumed')
+    queue.put_nowait(job_id)
+    return {'id': job_id, 'status': 'queued'}
 
 def update(job_id, **fields):
     with db() as conn:
         for col, value in fields.items():
-            if col not in ('status','progress','total','result','error'): raise ValueError(col)
-            conn.execute(f'UPDATE jobs SET {col}=%s, updated_at=now() WHERE id=%s', (json.dumps(value) if col == 'result' else value, job_id))
+            if col not in ('status','progress','total','result','error','details'): raise ValueError(col)
+            conn.execute(f'UPDATE jobs SET {col}=%s, updated_at=now() WHERE id=%s', (json.dumps(value) if col in ('result','details') else value, job_id))
 
 async def run_queue():
     while True:
@@ -365,7 +394,7 @@ async def run_queue():
                 kind, payload = conn.execute('SELECT kind,payload FROM jobs WHERE id=%s', (job_id,)).fetchone()
             update(job_id, status='running', error=None)
             result = await ingest(job_id, payload) if kind == 'backfill' else await asyncio.to_thread(run_backtest, job_id, payload)
-            update(job_id, status='complete', result=result)
+            update(job_id, status='partial' if result.get('failed_symbols') else 'complete', result=result)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -487,40 +516,74 @@ def write_window(instrument, interval, begin, end, candles):
 async def ingest(job_id, payload):
     instruments = payload['instruments']; intervals = payload['intervals']
     begin = date.fromisoformat(payload['from_date']); end = date.fromisoformat(payload['to_date'])
-    tasks = [(key, period, a, b) for key in instruments for period in intervals for a,b in windows(begin,end,INTERVALS[period][2])]
-    update(job_id, total=len(tasks))
+    per_symbol = sum(len(list(windows(begin,end,INTERVALS[period][2]))) for period in intervals)
+    update(job_id, total=len(instruments)*per_symbol)
     tokens = available_tokens()
     if not tokens: raise RuntimeError('No valid Upstox access tokens. Add fresh tokens in API Keys (tokens expire at 3:30 AM IST).')
-    count = 0; skipped = 0; completed = 0; next_index = 0
+    count = 0; skipped = 0; completed = 0; failed_symbols = []
     progress_lock = asyncio.Lock()
     async with httpx.AsyncClient(timeout=40, limits=httpx.Limits(max_connections=20)) as client:
-        async def runner():
-            nonlocal count, skipped, completed, next_index
-            while next_index < len(tasks):
-                key, period, a, b = tasks[next_index]
-                next_index += 1
-                try:
-                    def already_stored():
-                        with db() as conn:
-                            return conn.execute('SELECT 1 FROM coverage WHERE instrument=%s AND interval=%s AND from_date=%s AND to_date=%s', (key,period,a,b)).fetchone() is not None
-                    if await asyncio.to_thread(already_stored) and not payload.get('refresh_existing'):
-                        added = 0; was_skipped = True
-                    else:
-                        candles = await upstox(client,key,period,a,b,tokens)
-                        added = await asyncio.to_thread(write_window,key,period,a,b,candles)
-                        was_skipped = False
-                except Exception as exc:
-                    raise RuntimeError(f'Import failed for {key} {period} {a} to {b}: {str(exc) or exc.__class__.__name__}') from exc
-                async with progress_lock:
-                    count += added; skipped += int(was_skipped); completed += 1
-                    await asyncio.to_thread(update,job_id,progress=completed)
-        try:
-            async with asyncio.TaskGroup() as group:
-                for _ in range(min(len(tasks), min(16, max(2, int(os.environ.get('IMPORT_WORKERS', '8')))))):
-                    group.create_task(runner())
-        except* Exception as group:
-            raise RuntimeError(str(group.exceptions[0])) from group
-    return {'candles_added':count, 'windows_skipped':skipped, 'windows_total':len(tasks)}
+        universe_names = {row['instrument_key']: row['symbol'] for row in universe_rows()} if payload.get('universe') else {}
+        for symbol_index, value in enumerate(instruments):
+            key = value
+            if key in universe_names:
+                with db() as conn:
+                    conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (key, universe_names[key]))
+            if '|' not in key:
+                names = {}
+                key = (await resolve_instruments([value], names))[0]
+                with db() as conn:
+                    conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (key, value.upper()))
+            tasks = [(period,a,b) for period in intervals for a,b in windows(begin,end,INTERVALS[period][2])]
+            def stored_windows():
+                with db() as conn:
+                    return {(period,a,b) for period,a,b in conn.execute('SELECT interval,from_date,to_date FROM coverage WHERE instrument=%s AND interval=ANY(%s) AND to_date>=%s AND from_date<=%s', (key,intervals,begin,end)).fetchall()}
+            stored = await asyncio.to_thread(stored_windows)
+            update(job_id, details={'symbol': value, 'symbol_number': symbol_index+1,
+                                    'symbols_total': len(instruments), 'intervals': intervals,
+                                    'windows_for_symbol': len(tasks), 'windows_done_for_symbol': 0,
+                                    'skipped': skipped, 'candles_added': count, 'failed_symbols': failed_symbols})
+            next_index = 0; symbol_done = 0; current_interval = intervals[0]
+            async def runner():
+                nonlocal count, skipped, completed, next_index, symbol_done, current_interval
+                while next_index < len(tasks):
+                    period, a, b = tasks[next_index]; next_index += 1
+                    try:
+                        if (period,a,b) in stored and not payload.get('refresh_existing'):
+                            added = 0; was_skipped = True
+                        else:
+                            candles = await upstox(client,key,period,a,b,tokens)
+                            added = await asyncio.to_thread(write_window,key,period,a,b,candles)
+                            was_skipped = False
+                    except Exception as exc:
+                        raise RuntimeError(f'{value} {period} {a} to {b}: {str(exc) or exc.__class__.__name__}') from exc
+                    async with progress_lock:
+                        count += added; skipped += int(was_skipped); completed += 1; symbol_done += 1
+                        current_interval = period
+                        await asyncio.to_thread(update,job_id,progress=completed,
+                            details={'symbol':value,'symbol_number':symbol_index+1,
+                                     'symbols_total':len(instruments),'interval':current_interval,
+                                     'windows_for_symbol':len(tasks),'windows_done_for_symbol':symbol_done,
+                                     'skipped':skipped,'candles_added':count,'failed_symbols':failed_symbols})
+            symbol_error = None
+            try:
+                async with asyncio.TaskGroup() as group:
+                    for _ in range(min(len(tasks), min(16, max(2, int(os.environ.get('IMPORT_WORKERS', '8')))))):
+                        group.create_task(runner())
+            except* Exception as group:
+                symbol_error = group.exceptions[0]
+            if symbol_error:
+                if 'HTTP 400:' in str(symbol_error) or 'HTTP 404:' in str(symbol_error):
+                    failed_symbols.append({'symbol':value, 'error':str(symbol_error)[:300]})
+                    completed += len(tasks)-symbol_done
+                    update(job_id,progress=completed,details={'symbol':value,'symbol_number':symbol_index+1,
+                        'symbols_total':len(instruments),'interval':current_interval,
+                        'windows_for_symbol':len(tasks),'windows_done_for_symbol':symbol_done,
+                        'skipped':skipped,'candles_added':count,'failed_symbols':failed_symbols})
+                    continue
+                raise RuntimeError(str(symbol_error)) from symbol_error
+    return {'candles_added':count, 'windows_skipped':skipped, 'windows_total':len(instruments)*per_symbol,
+            'symbols_completed':len(instruments)-len(failed_symbols), 'failed_symbols':failed_symbols}
 
 def load_candles(instrument, interval, begin, end):
     with db() as conn:
