@@ -4,6 +4,7 @@ import base64
 import csv
 import io
 import hashlib
+import heapq
 from pathlib import Path
 import json
 import os
@@ -525,20 +526,23 @@ def load_candles(instrument, interval, begin, end):
     with db() as conn:
         rows = conn.execute('SELECT object_key FROM coverage WHERE instrument=%s AND interval=%s AND to_date >= %s AND from_date <= %s AND rows > 0 ORDER BY from_date', (instrument,interval,begin,end)).fetchall()
     frames = []
-    cache_root = Path(os.environ.get('CACHE_DIR', '/tmp/backtest-parquet-cache'))
-    cache_root.mkdir(parents=True, exist_ok=True)
     for (key,) in rows:
-        local = archive_path(key)
-        cached = local or cache_root / (hashlib.sha256(key.encode()).hexdigest() + '.parquet')
-        if local and not local.exists(): raise FileNotFoundError(f'Archive missing: {key}')
-        if not cached.exists():
-            obj = storage().get_object(Bucket=bucket(), Key=key)
-            temporary = cached.with_suffix('.tmp-' + uuid.uuid4().hex)
-            temporary.write_bytes(obj['Body'].read())
-            temporary.replace(cached)
-        frames.append(pl.read_parquet(cached))
+        frames.append(read_archive_frame(key))
     if not frames: return None
     return pl.concat(frames).filter(pl.col('session_date').is_between(begin,end)).unique(subset=['ts'], keep='last').sort('ts')
+
+def read_archive_frame(key):
+    cache_root = Path(os.environ.get('CACHE_DIR', '/tmp/backtest-parquet-cache'))
+    cache_root.mkdir(parents=True, exist_ok=True)
+    local = archive_path(key)
+    cached = local or cache_root / (hashlib.sha256(key.encode()).hexdigest() + '.parquet')
+    if local and not local.exists(): raise FileNotFoundError(f'Archive missing: {key}')
+    if not cached.exists():
+        obj = storage().get_object(Bucket=bucket(), Key=key)
+        temporary = cached.with_suffix('.tmp-' + uuid.uuid4().hex)
+        temporary.write_bytes(obj['Body'].read())
+        temporary.replace(cached)
+    return pl.read_parquet(cached)
 
 class DeleteArchive(BaseModel):
     instrument: str
@@ -564,26 +568,54 @@ def delete_archive(body: DeleteArchive):
         conn.execute('DELETE FROM instrument_names WHERE instrument=%s', (body.instrument,))
     return {'deleted_windows': len(keys), 'instrument': body.instrument}
 
-def validate_candle_query(instrument, interval, from_date, to_date):
+def validate_candle_query(instrument, interval, from_date, to_date, max_days=None):
     if interval not in INTERVALS: raise HTTPException(400, 'Unknown interval')
     if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+', instrument): raise HTTPException(400, 'Select an archived instrument')
-    if from_date > to_date or (to_date - from_date).days > 31: raise HTTPException(400, 'Select a date range of at most 31 days')
+    if from_date > to_date: raise HTTPException(400, 'FROM must be on or before TO')
+    if max_days is not None and (to_date - from_date).days > max_days: raise HTTPException(400, f'CSV export supports at most {max_days + 1} days at a time')
 
 @app.get('/candles', dependencies=[Depends(auth)])
 def candles(instrument: str, interval: str, from_date: date, to_date: date,
-            page: int = Query(1, ge=1), limit: int = Query(100, ge=1, le=250)):
+            cursor: str | None = None, limit: int = Query(100, ge=1, le=250)):
     validate_candle_query(instrument, interval, from_date, to_date)
-    if page > 10000: raise HTTPException(400, 'Page is too large')
-    frame = load_candles(instrument, interval, from_date, to_date)
-    if frame is None: return {'rows': [], 'total': 0, 'page': page, 'limit': limit}
-    total = frame.height
-    rows = frame.sort('ts', descending=True).slice((page - 1) * limit, limit).to_dicts()
+    cutoff = None
+    if cursor:
+        try: cutoff = datetime.fromisoformat(cursor)
+        except ValueError as exc: raise HTTPException(400, 'Invalid page cursor') from exc
+        if cutoff.tzinfo is None: raise HTTPException(400, 'Invalid page cursor')
+    with db() as conn:
+        keys = conn.execute('SELECT object_key,to_date FROM coverage WHERE instrument=%s AND interval=%s AND to_date>=%s AND from_date<=%s AND rows>0 ORDER BY to_date DESC, from_date DESC', (instrument,interval,from_date,to_date)).fetchall()
+    found = []; seen = set(); heap = []; index = 0
+    def load_next():
+        nonlocal index
+        key, _ = keys[index]; index += 1
+        frame = read_archive_frame(key).filter(pl.col('session_date').is_between(from_date,to_date))
+        if cutoff: frame = frame.filter(pl.col('ts') < cutoff)
+        iterator = iter(frame.sort('ts', descending=True).iter_rows(named=True))
+        row = next(iterator, None)
+        if row: heapq.heappush(heap, (-int(row['ts'].timestamp()*1_000_000), index, row, iterator))
+    while heap or index < len(keys):
+        if not heap:
+            load_next()
+            continue
+        next_date = heap[0][2]['ts'].astimezone(IST).date()
+        if index < len(keys) and keys[index][1] >= next_date:
+            load_next()
+            continue
+        _, position, row, iterator = heapq.heappop(heap)
+        following = next(iterator, None)
+        if following: heapq.heappush(heap, (-int(following['ts'].timestamp()*1_000_000), position, following, iterator))
+        if row['ts'] in seen: continue
+        seen.add(row['ts']); found.append(row)
+        if len(found) > limit: break
+    has_more = len(found) > limit
+    rows = found[:limit]
     return {'rows': [{**row, 'ts': row['ts'].astimezone(IST).isoformat(), 'session_date': row['session_date'].isoformat()} for row in rows],
-            'total': total, 'page': page, 'limit': limit}
+            'has_more': has_more, 'next_cursor': rows[-1]['ts'].isoformat() if has_more else None, 'limit': limit}
 
 @app.get('/candles/export', dependencies=[Depends(auth)])
 def export_candles(instrument: str, interval: str, from_date: date, to_date: date):
-    validate_candle_query(instrument, interval, from_date, to_date)
+    validate_candle_query(instrument, interval, from_date, to_date, max_days=30)
     frame = load_candles(instrument, interval, from_date, to_date)
     output = io.StringIO()
     writer = csv.writer(output)
