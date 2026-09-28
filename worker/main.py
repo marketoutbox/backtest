@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field, field_validator
 IST = ZoneInfo('Asia/Kolkata')
 INTERVALS = {'1m': ('minutes', 1, 28), '5m': ('minutes', 5, 28), '15m': ('minutes', 15, 28), '30m': ('minutes', 30, 85), '1h': ('hours', 1, 85), '1d': ('days', 1, 3000), '1w': ('weeks', 1, 8000), '1mo': ('months', 1, 8000)}
 START = date(2022, 1, 1)
+TOKEN_PROBE_URL = 'https://api.upstox.com/v3/historical-candle/NSE_EQ%7CINE002A01018/days/1/2025-01-02/2025-01-01'
 app = FastAPI(title='Backtest Desk worker')
 queue: asyncio.Queue[str] = asyncio.Queue()
 rate_locks: dict[str, asyncio.Lock] = {}
@@ -133,6 +134,8 @@ CREATE TABLE IF NOT EXISTS jobs (id text PRIMARY KEY, kind text NOT NULL, status
 CREATE TABLE IF NOT EXISTS coverage (instrument text NOT NULL, interval text NOT NULL, from_date date NOT NULL, to_date date NOT NULL, rows integer NOT NULL, object_key text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (instrument, interval, from_date, to_date));
 CREATE TABLE IF NOT EXISTS instrument_names (instrument text PRIMARY KEY, symbol text NOT NULL);
 CREATE TABLE IF NOT EXISTS api_tokens (id text PRIMARY KEY, label text NOT NULL, account_id text NOT NULL UNIQUE, encrypted_token text NOT NULL, expires_at timestamptz NOT NULL, status text NOT NULL DEFAULT 'ready', created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE api_tokens ALTER COLUMN expires_at DROP NOT NULL;
+ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS token_type text NOT NULL DEFAULT 'oauth';
 ALTER TABLE coverage ADD COLUMN IF NOT EXISTS first_candle date;
 ALTER TABLE coverage ADD COLUMN IF NOT EXISTS last_candle date;
 '''
@@ -195,6 +198,11 @@ def environment_account():
         with httpx.Client(timeout=8) as client:
             response = client.get('https://api.upstox.com/v2/user/profile', headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
         if response.status_code == 200: account_id = response.json().get('data', {}).get('user_id')
+        else:
+            with httpx.Client(timeout=8) as client:
+                candle_response = client.get(TOKEN_PROBE_URL, headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
+            if candle_response.status_code == 200:
+                account_id = 'ANALYTICS:' + digest[:12]
     except (httpx.RequestError, ValueError): pass
     environment_profile_cache.update(digest=digest, account_id=account_id, until=time.monotonic()+300)
     return account_id
@@ -202,33 +210,42 @@ def environment_account():
 class AddToken(BaseModel):
     label: str = Field(min_length=1, max_length=60)
     access_token: str = Field(min_length=20, max_length=4096)
+    account_id: str | None = None
 
 @app.get('/api-keys', dependencies=[Depends(auth)])
 def list_api_keys():
     with db() as conn:
-        rows = conn.execute('SELECT id,label,account_id,expires_at,status FROM api_tokens ORDER BY created_at').fetchall()
-    saved = [{'id': a, 'label': b, 'account_id': c, 'expires_at': d.isoformat(), 'status': e} for a,b,c,d,e in rows]
+        rows = conn.execute('SELECT id,label,account_id,expires_at,status,token_type FROM api_tokens ORDER BY created_at').fetchall()
+    saved = [{'id': a, 'label': b, 'account_id': c, 'expires_at': d.isoformat() if d else None, 'status': e, 'token_type': kind} for a,b,c,d,e,kind in rows]
     if os.environ.get('UPSTOX_ACCESS_TOKEN'):
         account_id = environment_account()
-        active_ids = {row[2] for row in rows if row[3] > datetime.now(timezone.utc) and row[4] == 'ready'}
-        saved.append({'id': 'environment', 'label': 'Railway access token', 'account_id': account_id or 'Unverified', 'expires_at': None, 'status': 'environment' if account_id or not rows else 'unverified', 'used': bool(account_id and account_id not in active_ids) or not rows})
+        used = any(item['id'] == 'environment' for item in available_tokens())
+        saved.append({'id': 'environment', 'label': 'Railway access token', 'account_id': account_id or 'Unverified', 'expires_at': None, 'status': 'environment' if account_id or not rows else 'unverified', 'token_type': 'environment', 'used': used})
     return {'keys': saved, 'saved_count': len(rows), 'requests_per_minute_per_account': min(int(os.environ.get('MAX_REQUESTS_PER_MINUTE', '450')), 480), 'parallel_workers': min(16, max(2, int(os.environ.get('IMPORT_WORKERS', '8'))))}
 
 @app.post('/api-keys', dependencies=[Depends(auth)])
 async def add_api_key(body: AddToken):
     token = body.access_token.strip()
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get('https://api.upstox.com/v2/user/profile', headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
-    except httpx.RequestError as exc:
-        raise HTTPException(502, f'Could not validate Upstox token: {exc.__class__.__name__}') from exc
-    if response.status_code != 200: raise HTTPException(400, 'Upstox rejected the access token. Generate a fresh token for this account.')
-    account_id = response.json().get('data', {}).get('user_id')
-    if not account_id: raise HTTPException(502, 'Upstox profile did not include a user ID')
+    headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
+    async with httpx.AsyncClient(timeout=15) as client:
+        # The profile API may require a static IP for Analytics Tokens; verify candle access independently.
+        profile, probe = await asyncio.gather(
+            client.get('https://api.upstox.com/v2/user/profile', headers=headers),
+            client.get(TOKEN_PROBE_URL, headers=headers), return_exceptions=True)
+    if isinstance(probe, httpx.RequestError):
+        raise HTTPException(502, f'Could not verify Upstox candle access: {probe.__class__.__name__}') from probe
+    if isinstance(profile, httpx.RequestError): profile = None
+    if probe.status_code != 200:
+        raise HTTPException(400, f'Upstox historical candle API returned HTTP {probe.status_code}; this token could not be verified for downloads. Profile API returned HTTP {profile.status_code if profile else "unreachable"}.')
+    profile_data = profile.json().get('data', {}) if profile is not None and profile.status_code == 200 else {}
+    token_type = 'oauth' if profile_data.get('user_id') else 'analytics'
+    account_id = profile_data['user_id'] if token_type == 'oauth' else (body.account_id or body.label).strip().upper()
+    if not re.fullmatch(r'[A-Z0-9 _.-]{1,60}', account_id): raise HTTPException(400, 'Enter a valid account ID or label')
+    expires_at = token_expiry() if token_type == 'oauth' else None
     encrypted = token_cipher().encrypt(token.encode()).decode()
     with db() as conn:
-        row = conn.execute("INSERT INTO api_tokens (id,label,account_id,encrypted_token,expires_at,status) VALUES (%s,%s,%s,%s,%s,'ready') ON CONFLICT (account_id) DO UPDATE SET label=excluded.label, encrypted_token=excluded.encrypted_token, expires_at=excluded.expires_at, status='ready' RETURNING id", (str(uuid.uuid4()),body.label.strip(),account_id,encrypted,token_expiry())).fetchone()
-    return {'id': row[0], 'label': body.label.strip(), 'account_id': account_id}
+        row = conn.execute("INSERT INTO api_tokens (id,label,account_id,encrypted_token,expires_at,status,token_type) VALUES (%s,%s,%s,%s,%s,'ready',%s) ON CONFLICT (account_id) DO UPDATE SET label=excluded.label, encrypted_token=excluded.encrypted_token, expires_at=excluded.expires_at, status='ready', token_type=excluded.token_type RETURNING id", (str(uuid.uuid4()),body.label.strip(),account_id,encrypted,expires_at,token_type)).fetchone()
+    return {'id': row[0], 'label': body.label.strip(), 'account_id': account_id, 'token_type': token_type}
 
 @app.delete('/api-keys/{key_id}', dependencies=[Depends(auth)])
 def delete_api_key(key_id: str):
@@ -241,7 +258,7 @@ def delete_api_key(key_id: str):
 
 def available_tokens():
     with db() as conn:
-        rows = conn.execute("SELECT id,account_id,encrypted_token FROM api_tokens WHERE expires_at > now() AND status='ready' ORDER BY created_at").fetchall()
+        rows = conn.execute("SELECT id,account_id,encrypted_token FROM api_tokens WHERE (expires_at IS NULL OR expires_at > now()) AND status='ready' ORDER BY created_at").fetchall()
         saved_count = conn.execute('SELECT count(*) FROM api_tokens').fetchone()[0]
     tokens = []
     if rows:
@@ -249,9 +266,10 @@ def available_tokens():
         tokens = [{'id': a, 'account_id': b, 'token': cipher.decrypt(c.encode()).decode()} for a,b,c in rows]
     if os.environ.get('UPSTOX_ACCESS_TOKEN'):
         account_id = environment_account()
-        if account_id and account_id not in {row['account_id'] for row in tokens}:
+        duplicate_token = any(row['token'] == os.environ['UPSTOX_ACCESS_TOKEN'] for row in tokens)
+        if not duplicate_token and account_id and account_id not in {row['account_id'] for row in tokens}:
             tokens.append({'id': 'environment', 'account_id': account_id, 'token': os.environ['UPSTOX_ACCESS_TOKEN']})
-        elif not saved_count:
+        elif not duplicate_token and not saved_count:
             tokens.append({'id': 'environment', 'account_id': 'environment', 'token': os.environ['UPSTOX_ACCESS_TOKEN']})
     return tokens
 
