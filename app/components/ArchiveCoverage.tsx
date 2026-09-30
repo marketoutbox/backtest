@@ -16,6 +16,7 @@ export default function ArchiveCoverage({revision,onSelect}:{revision:number;onS
         const response=await fetch(`/api/symbols?${query}`,{cache:'no-store',signal:abort.signal});
         const data=await response.json();if(!response.ok)throw new Error(data.detail||'Could not load archive');
         if(abort.signal.aborted)return;
+        if(!Array.isArray(data.symbols)||!Number.isSafeInteger(data.total)||data.total<0)throw new Error('Archive pagination is unavailable. Redeploy the Railway worker to the latest version, then refresh this page.');
         const lastPage=Math.max(1,Math.ceil(data.total/pageSize));
         if(page>lastPage){setPage(lastPage);return;}
         setRows(data.symbols);setTotal(data.total);
