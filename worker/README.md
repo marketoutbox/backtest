@@ -5,40 +5,46 @@ API Keys accepts Upstox Analytics Tokens (read-only, up to one year) and daily O
 Import jobs remain in Postgres and restart after a process restart. Run only one worker process because the in-process queue and rate limiter are not distributed.
 
 
-## Download and restore a data backup
+## Background data backups
 
-In **Data archive → Data backup → Download data backup**, select a parent folder on your PC using Chrome or Edge over HTTPS. The app creates `backtest-data-backup` there. Keep that whole folder. Parquet files retain their existing compression, so a roughly 7 GB archive remains roughly that size, plus small metadata/receipt files; no CSV expansion or second 7 GB server-side ZIP is needed.
+In **Data archive → Data backup**, click **Prepare data backup**. The worker records a durable backup job in Postgres, then creates one ZIP64 archive in the background. The page polls job status and displays **Download ZIP** when ready. You can close the page and return later; preparation does not depend on the browser. No folder picker or browser-side assembly is used.
 
-Finish active jobs first. While a backup session is active, new jobs, resume, archive deletion and label edits return 409. Each successful request renews a five-minute lease. Cancel releases it; closing the tab or losing the connection releases it after the lease expires. This uses the existing **single-worker-process** deployment model. Never run multiple Uvicorn workers/replicas with this app. External changes to the archive or database must also be paused.
+Finish active jobs first. During preparation, new jobs, resume, archive deletion and label edits return 409. Once the ZIP is complete, the live archive can change without changing the prepared backup. The existing startup recovery requeues interrupted jobs; an interrupted backup is rebuilt. Keep the existing single-worker-process/replica deployment. External archive/database writers must also be paused during preparation.
 
-The browser fetches metadata in pages and prices in at most 2 MiB responses through authenticated Next.js routes. It writes directly to disk and checks SHA-256 for each chunk. Completed files have receipts. Retrying in the same parent folder verifies and reuses unchanged completed files; an interrupted file downloads again. A complete `manifest.json` is written only after all files succeed. Old extra files/receipts may remain after a resumed backup; the manifest identifies exactly what belongs to the completed snapshot.
+The ZIP contains the existing compressed Parquet files, per-chunk SHA-256 checksums, coverage including empty windows, candle dates and instrument labels. Parquet is stored without recompression; a roughly 7 GB archive produces a roughly 7 GB ZIP. Credentials, jobs/backtest history, unindexed files and disposable read caches are excluded. This is a restorable application price-data backup, not a complete PostgreSQL dump.
 
-The backup contains every indexed stock/timeframe, empty coverage windows, candle dates and instrument labels. It excludes API tokens, passwords, jobs/backtest history, unindexed files and the disposable read cache. It is an application data backup, not a full PostgreSQL dump.
+### Storage and download
+
+- **S3-compatible archive:** the worker writes ZIP bytes directly into an S3 multipart upload using bounded buffers. No extra full-size local ZIP is required. The completed backup occupies additional object storage under `backups/<job-id>.zip`. The storage credentials need multipart create/upload/complete/abort/list plus normal read/write/delete permissions. Configure a bucket lifecycle rule to abort abandoned multipart uploads as an additional cleanup measure.
+- **Mounted-volume archive:** the worker creates the ZIP under `ARCHIVE_DIR/.backups` by default. Set `BACKUP_DIR` to another persistent mounted directory if desired. It checks available disk space before starting: allow approximately the archive size again, plus metadata headroom. Completed ZIPs are published by atomic rename; failed temporary files are removed.
+- **Download:** the authenticated Next.js route obtains a short-lived download link and redirects the browser. The multi-GB ZIP never passes through a Vercel function or browser JavaScript buffer. S3 uses a one-hour presigned object URL. Local files use a one-hour HMAC-signed worker URL with native file/range serving. `WORKER_URL` and the storage endpoint must be browser-reachable HTTPS addresses for their respective download modes. Treat generated URLs as temporary bearer links; anyone holding one can download that backup until expiry. Neither link exposes `WORKER_SECRET`.
+- **Resume:** where supported by the browser/storage, byte-range requests allow interrupted downloads to resume while the URL is valid. If a link expires, click Download ZIP again to obtain a fresh link. The prepared artifact remains available; no new Upstox download or backup preparation is needed.
+- **Retention:** backups are not automatically deleted. The page shows the 20 most recent backup jobs. Use **Delete server backup** after saving your independent copy to reclaim space; it deletes that generated ZIP and its job record, not the stock archive. No permanent download URLs are stored in Postgres.
+
+Deploy both the frontend and worker for this flow. Existing folder backups from the earlier implementation are still accepted by the restore script.
 
 ### Verify on your PC
 
-Use Python 3.12 and get `worker/restore_backup.py` from this repository. Verification needs only Python's standard library:
+Use Python 3.12 and `worker/restore_backup.py` from this repository. Verification needs only Python's standard library and reads the ZIP directly, without extracting another full copy:
 
 ```sh
-python worker/restore_backup.py "/path/to/backtest-data-backup"
+python worker/restore_backup.py "/path/to/backtest-data-backup-ID.zip"
 ```
 
-A missing manifest means the download is incomplete. Any missing/truncated/corrupted file fails verification. Keep an additional independent copy of a completed backup if replacing the contents of the same backup folder.
+Missing, truncated or corrupted data fails verification. Keep the complete ZIP as your backup.
 
 ### Restore to Railway / a replacement worker
 
 1. Prepare an **empty destination archive database** and stop the destination worker during restore. The command refuses an existing coverage index or queued/running jobs; it never clears existing data. Keep the original service/data until the replacement is checked.
-2. Install the dependencies in `worker/requirements.txt` on the machine running the restore. Configure the destination's `DATABASE_URL` and storage variables in that machine's environment; do not put secrets in commands committed to Git. The schema is created automatically.
-3. For S3-compatible storage, run from your PC with the destination bucket credentials (`S3_BUCKET`, `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_REGION`) and an externally reachable Railway Postgres connection URL. The command uploads directly to the bucket and writes the matching Postgres index. Railway's internal database hostname is only reachable inside Railway.
-4. For a Railway mounted-volume archive (`ARCHIVE_DIR`), first transfer the backup folder to a machine/container with access to that volume, then run the command there with the destination `ARCHIVE_DIR` and database URL. Setting `ARCHIVE_DIR` on your PC writes to your PC, not to Railway. Allow space for both the uploaded backup and restored files when using the same volume.
+2. Install `worker/requirements.txt` on the machine running the restore. Configure the destination's `DATABASE_URL` and storage variables in that machine's environment; do not commit secrets. The schema is created automatically.
+3. For S3 storage, run from your PC using the destination bucket credentials and an externally reachable Railway Postgres connection URL. The command streams directly from the ZIP to the destination bucket and writes the matching Postgres index. Railway's internal database hostname is only reachable inside Railway.
+4. For a Railway mounted-volume archive, transfer the ZIP to a machine/container with access to that volume and run the command there with the destination `ARCHIVE_DIR` and database URL. Setting `ARCHIVE_DIR` on your PC writes to your PC, not Railway. Allow space for the ZIP and the restored files when using the same volume.
 5. Run:
 
 ```sh
-python worker/restore_backup.py "/path/to/backtest-data-backup" --restore
+python worker/restore_backup.py "/path/to/backtest-data-backup-ID.zip" --restore
 ```
 
-The entire backup is verified before connecting to the destination. Files upload under a fresh `restored/<id>/` prefix, and index rows commit together only after all files upload successfully. A failed restore leaves no committed partial index, but can leave unreferenced files under that attempt's prefix; remove those only after confirming the attempt failed, or use a fresh bucket/volume. Restoring after an interruption repeats the upload.
+All files are verified before connecting to the destination. Uploads use a fresh `restored/<id>/` prefix, and index rows commit together after every file uploads. A failed restore leaves no committed partial index but may leave unreferenced files under that attempt's prefix. Remove them only after confirming failure, or use a fresh destination. Retrying restore repeats uploads. Start the worker afterward, check Data Viewer and re-add API tokens for future imports. Restoration makes no Upstox calls. Browser upload restoration is not included.
 
-Start the worker with the same destination storage/database settings, check symbols/timeframes and sample prices in Data Viewer, then re-add Upstox tokens for future imports. Restoring the saved prices makes **no Upstox calls**. The backup button requires deploying both the updated Next.js app and Python worker. The restore is currently a command, not a browser upload button.
-
-Tests: `python -m pytest worker/tests -q` (install pytest separately).
+Validation: `python -m pytest worker/tests -q` (install pytest separately), `node scripts/test-backup-picker.cjs` for the server-backup UI regression checks, and `npm run build`.
