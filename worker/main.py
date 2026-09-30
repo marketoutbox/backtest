@@ -67,7 +67,7 @@ def auth(x_worker_secret: str | None = Header(None)):
     if not expected or x_worker_secret != expected: raise HTTPException(401, 'Unauthorized')
 
 archive_backup = ArchiveBackup(db, archive_path, storage, bucket)
-app.include_router(archive_backup.router(auth))
+app.include_router(archive_backup.router(auth, lambda: submit('backup', {})))
 
 def validate_key(value: str):
     if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+|[A-Za-z0-9&_.-]{1,50}', value): raise ValueError('Enter an NSE ticker such as RELIANCE or an Upstox instrument key such as NSE_EQ|INE002A01018')
@@ -400,7 +400,12 @@ async def run_queue():
             with db() as conn:
                 kind, payload = conn.execute('SELECT kind,payload FROM jobs WHERE id=%s', (job_id,)).fetchone()
             update(job_id, status='running', error=None)
-            result = await ingest(job_id, payload) if kind == 'backfill' else await asyncio.to_thread(run_backtest, job_id, payload)
+            if kind == 'backfill':
+                result = await ingest(job_id, payload)
+            elif kind == 'backup':
+                result = await asyncio.to_thread(archive_backup.build, job_id, update)
+            else:
+                result = await asyncio.to_thread(run_backtest, job_id, payload)
             update(job_id, status='partial' if result.get('failed_symbols') else 'complete', result=result)
         except asyncio.CancelledError:
             raise
