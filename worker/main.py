@@ -284,30 +284,37 @@ def available_tokens():
 def status():
     with db() as conn:
         rows = conn.execute('SELECT interval, count(DISTINCT instrument), sum(rows) FROM coverage GROUP BY interval').fetchall()
+        instrument_count = conn.execute('SELECT count(DISTINCT instrument) FROM coverage').fetchone()[0]
         running = conn.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
-    return {'archive': [{'interval': x, 'instruments': y, 'candles': z} for x,y,z in rows], 'active_jobs': running, 'intervals': list(INTERVALS)}
+    return {'archive': [{'interval': x, 'instruments': y, 'candles': z} for x,y,z in rows], 'active_jobs': running, 'instrument_count': instrument_count, 'intervals': list(INTERVALS)}
+
+@app.get('/instruments', dependencies=[Depends(auth)])
+def archived_instruments(search: str = Query('', max_length=100), limit: int = Query(50, ge=1, le=100)):
+    term = search.strip()
+    with db() as conn:
+        rows = conn.execute("""SELECT DISTINCT c.instrument,coalesce(n.symbol,c.instrument) AS symbol FROM coverage c LEFT JOIN instrument_names n ON n.instrument=c.instrument WHERE (strpos(lower(c.instrument),lower(%s))>0 OR strpos(lower(coalesce(n.symbol,'')),lower(%s))>0) ORDER BY symbol,c.instrument LIMIT %s""", (term,term,limit)).fetchall()
+    return {'instruments': [{'instrument': key, 'symbol': name} for key,name in rows]}
 
 @app.get('/symbols', dependencies=[Depends(auth)])
-def symbols():
+def symbols(search: str = Query('', max_length=100), interval: str | None = None,
+            instrument: str | None = Query(None, max_length=100),
+            limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+    if interval is not None and interval not in INTERVALS: raise HTTPException(400, 'Unknown interval')
+    conditions = []; params = []
+    if instrument:
+        conditions.append('c.instrument=%s'); params.append(instrument)
+    if interval:
+        conditions.append('c.interval=%s'); params.append(interval)
+    if search.strip():
+        term = search.strip()
+        conditions.append("""(strpos(lower(c.instrument),lower(%s))>0 OR strpos(lower(coalesce(n.symbol,'')),lower(%s))>0)"""); params.extend([term,term])
+    where = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
+    joined = ' FROM coverage c LEFT JOIN instrument_names n ON n.instrument=c.instrument' + where
     with db() as conn:
-        missing = conn.execute('SELECT DISTINCT c.instrument FROM coverage c LEFT JOIN instrument_names n ON n.instrument=c.instrument WHERE n.instrument IS NULL LIMIT 10').fetchall()
-        token_pool = available_tokens()
-        token = token_pool[0]['token'] if token_pool else None
-        if token and missing:
-            with httpx.Client(timeout=6) as client:
-                for (key,) in missing:
-                    if not key.startswith('NSE_EQ|'): continue
-                    try:
-                        response = client.get('https://api.upstox.com/v2/instruments/search',
-                            params={'query': key.split('|', 1)[1], 'exchanges': 'NSE', 'segments': 'EQ', 'records': 30},
-                            headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
-                        if response.status_code == 200:
-                            match = next((item for item in response.json().get('data', []) if str(item.get('instrument_key', '')).upper() == key.upper()), None)
-                            if match and match.get('trading_symbol'):
-                                conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (key, match['trading_symbol']))
-                    except (httpx.RequestError, ValueError): pass
-        rows = conn.execute('SELECT c.instrument, c.interval, min(c.from_date), max(c.to_date), sum(c.rows), count(*), n.symbol, min(c.first_candle), max(c.last_candle), count(*) FILTER (WHERE c.rows > 0), count(*) FILTER (WHERE c.rows > 0 AND c.first_candle IS NOT NULL) FROM coverage c LEFT JOIN instrument_names n ON n.instrument=c.instrument GROUP BY c.instrument,c.interval,n.symbol ORDER BY coalesce(n.symbol,c.instrument),c.interval').fetchall()
-    return {'symbols': [{'instrument': a, 'interval': b, 'from_date': str(c), 'to_date': str(d), 'candles': e, 'windows': w, 'symbol': name or a, 'first_candle': str(first) if first else None, 'last_candle': str(last) if last else None, 'filled_windows': filled, 'verified_windows': verified} for a,b,c,d,e,w,name,first,last,filled,verified in rows]}
+        total = conn.execute('SELECT count(*) FROM (SELECT c.instrument,c.interval' + joined + ' GROUP BY c.instrument,c.interval) grouped', params).fetchone()[0]
+        page_keys = 'SELECT c.instrument,c.interval,n.symbol' + joined + ' GROUP BY c.instrument,c.interval,n.symbol ORDER BY coalesce(n.symbol,c.instrument),c.instrument,c.interval LIMIT %s OFFSET %s'
+        rows = conn.execute('WITH page_keys AS (' + page_keys + ') SELECT c.instrument,c.interval,min(c.from_date),max(c.to_date),sum(c.rows),count(*),p.symbol,min(c.first_candle),max(c.last_candle),count(*) FILTER (WHERE c.rows>0),count(*) FILTER (WHERE c.rows>0 AND c.first_candle IS NOT NULL) FROM page_keys p JOIN coverage c ON c.instrument=p.instrument AND c.interval=p.interval GROUP BY c.instrument,c.interval,p.symbol ORDER BY coalesce(p.symbol,c.instrument),c.instrument,c.interval', [*params,limit,offset]).fetchall()
+    return {'symbols': [{'instrument': a, 'interval': b, 'from_date': str(c), 'to_date': str(d), 'candles': e, 'windows': w, 'symbol': name or a, 'first_candle': str(first) if first else None, 'last_candle': str(last) if last else None, 'filled_windows': filled, 'verified_windows': verified} for a,b,c,d,e,w,name,first,last,filled,verified in rows], 'total': total, 'limit': limit, 'offset': offset}
 
 class InstrumentLabel(BaseModel):
     instrument: str
