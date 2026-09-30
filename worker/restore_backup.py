@@ -1,5 +1,6 @@
 """Verify a downloaded data backup; restore it to an empty archive with --restore."""
 import argparse
+from contextlib import contextmanager
 from datetime import date
 import hashlib
 import json
@@ -7,6 +8,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import uuid
+import zipfile
 
 CHUNK_SIZE = 2 * 1024 * 1024
 COLUMNS = ('instrument', 'interval', 'from_date', 'to_date', 'rows', 'object_key', 'first_candle', 'last_candle')
@@ -23,9 +25,38 @@ def backup_file(root, relative):
     return resolved
 
 
+@contextmanager
+def open_backup_file(root, relative):
+    root = Path(root)
+    if root.is_file():
+        path = PurePosixPath(relative)
+        if path.is_absolute() or '..' in path.parts or chr(92) in relative or not relative.startswith('files/'):
+            raise ValueError('Unsafe backup file path')
+        with zipfile.ZipFile(root) as archive:
+            name = 'backtest-data-backup/' + relative
+            info = archive.getinfo(name)
+            with archive.open(info) as stream:
+                yield stream, info.file_size
+    else:
+        path = backup_file(root, relative)
+        with path.open('rb') as stream:
+            yield stream, path.stat().st_size
+
+
+def read_manifest(root):
+    root = Path(root)
+    if root.is_file():
+        with zipfile.ZipFile(root) as archive:
+            info = archive.getinfo('backtest-data-backup/manifest.json')
+            if info.file_size > 256 * 1024 * 1024:
+                raise ValueError('Backup manifest is too large')
+            return json.loads(archive.read(info))
+    return json.loads((root / 'manifest.json').read_text())
+
+
 def verify_backup(root):
     root = Path(root)
-    manifest = json.loads((root / 'manifest.json').read_text())
+    manifest = read_manifest(root)
     if manifest.get('format') != 'backtest-desk-archive' or manifest.get('version') != 1 or manifest.get('chunk_size') != CHUNK_SIZE:
         raise ValueError('Unsupported or incomplete backup')
     coverage = manifest['coverage']
@@ -58,13 +89,14 @@ def verify_backup(root):
         raise ValueError('Backup inventory does not match coverage')
     total = 0
     for entry in files:
-        path = backup_file(root, entry['path'])
         size = entry['size']
-        if not isinstance(size, int) or size <= 0 or path.stat().st_size != size:
-            raise ValueError(f'Backup file size mismatch: {entry["path"]}')
+        if not isinstance(size, int) or size <= 0:
+            raise ValueError('Invalid backup size')
         if len(entry['chunks']) != (size + CHUNK_SIZE - 1) // CHUNK_SIZE:
             raise ValueError('Incomplete file checksums')
-        with path.open('rb') as source:
+        with open_backup_file(root, entry['path']) as (source, actual_size):
+            if actual_size != size:
+                raise ValueError(f'Backup file size mismatch: {entry["path"]}')
             for expected in entry['chunks']:
                 if hashlib.sha256(source.read(CHUNK_SIZE)).hexdigest() != expected:
                     raise ValueError(f'Backup checksum mismatch: {entry["path"]}')
@@ -106,7 +138,6 @@ def restore(root, manifest):
         if conn.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone():
             raise ValueError('The target has active jobs; stop them before restoring')
         for index, entry in enumerate(manifest['files']):
-            source = backup_file(Path(root), entry['path'])
             # New independent keys avoid overwriting files from any existing archive.
             key = prefix + hashlib.sha256(entry['key'].encode()).hexdigest() + '.parquet'
             if archive:
@@ -114,7 +145,7 @@ def restore(root, manifest):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 temporary = target.with_suffix('.tmp')
                 try:
-                    with source.open('rb') as reader, temporary.open('wb') as writer:
+                    with open_backup_file(root, entry['path']) as (reader, _), temporary.open('wb') as writer:
                         for expected in entry['chunks']:
                             data = reader.read(CHUNK_SIZE)
                             if hashlib.sha256(data).hexdigest() != expected:
@@ -124,7 +155,8 @@ def restore(root, manifest):
                 finally:
                     temporary.unlink(missing_ok=True)
             else:
-                client.upload_file(str(source), bucket, key, Config=TransferConfig(max_concurrency=2, multipart_chunksize=8*1024*1024))
+                with open_backup_file(root, entry['path']) as (reader, _):
+                    client.upload_fileobj(reader, bucket, key, Config=TransferConfig(use_threads=False, multipart_chunksize=8*1024*1024))
             print(f'Uploaded {index + 1}/{len(manifest["files"])} files', flush=True)
         for row in manifest['coverage']:
             copied = dict(row)
@@ -137,7 +169,7 @@ def restore(root, manifest):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('folder', type=Path, help='Downloaded backtest-data-backup folder')
+    parser.add_argument('folder', type=Path, help='Downloaded backup ZIP (or legacy backtest-data-backup folder)')
     parser.add_argument('--restore', action='store_true', help='Upload verified data to an EMPTY target archive')
     args = parser.parse_args()
     manifest, size = verify_backup(args.folder)
