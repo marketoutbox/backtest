@@ -1,152 +1,71 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-type Folder = {getDirectoryHandle: (name: string, options?: {create?: boolean}) => Promise<Folder>;
-  getFileHandle: (name: string, options?: {create?: boolean}) => Promise<FileSystemFileHandle>;
-  removeEntry: (name: string) => Promise<void>};
-type WindowRow = {instrument: string; interval: string; from_date: string; to_date: string;
-  rows: number; object_key: string; first_candle: string | null; last_candle: string | null};
-type SavedFile = {key: string; path: string; size: number; version: string; chunks: string[]};
-const hex = async (data: BufferSource) => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', data)), n => n.toString(16).padStart(2, '0')).join('');
-
-async function writeJson(folder: Folder, name: string, value: unknown) {
-  const handle = await folder.getFileHandle(name, {create: true});
-  const stream = await handle.createWritable();
-  try { await stream.write(JSON.stringify(value)); await stream.close(); }
-  catch (error) { await stream.abort().catch(() => {}); throw error; }
-}
-
-// A native picker can outlive a component unmount (for example, a tab change).
-let folderPickerOpen = false;
+type Backup = {id: string; status: string; progress: number; total: number; error?: string;
+  created_at: string; details?: {stage?: string; bytes?: number}; result?: {size: number; files: number}};
+const size = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 
 export default function DataBackup() {
+  const [backups, setBackups] = useState<Backup[]>([]);
   const [busy, setBusy] = useState(false);
-  const [choosingFolder, setChoosingFolder] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
-  const controller = useRef<AbortController | null>(null);
+  const pending = useRef(false);
+  const request = useCallback(async (path = '', method = 'GET') => {
+    const response = await fetch(`/api/backup${path}`, {method, cache: 'no-store', signal: AbortSignal.timeout(60000)});
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch { throw new Error(`Backup service returned HTTP ${response.status}. Check that the worker is updated.`); }
+    if (!response.ok) throw new Error(data.detail || `Backup request failed (${response.status})`);
+    return data;
+  }, []);
+  const refresh = useCallback(async () => {
+    try { setBackups((await request()).backups); setError(''); }
+    catch (e) { setError((e as Error).message); }
+    finally { setLoading(false); }
+  }, [request]);
+  useEffect(() => { refresh(); const timer = setInterval(refresh, 5000); return () => clearInterval(timer); }, [refresh]);
+  const active = backups.some(item => ['queued', 'running'].includes(item.status));
 
-  useEffect(() => () => controller.current?.abort(), []);
-  useEffect(() => {
-    if (!busy) return;
-    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
-    window.addEventListener('beforeunload', warn);
-    return () => window.removeEventListener('beforeunload', warn);
-  }, [busy]);
-
-  async function download() {
-    // The ref guards synchronous/repeated clicks before React renders disabled.
-    if (controller.current) return;
-    if (folderPickerOpen) {
-      setError('A folder chooser is already open. Finish or close that dialog, then try again.');
-      return;
-    }
-    const picker = (window as unknown as {showDirectoryPicker?: (options: {mode: string}) => Promise<Folder>}).showDirectoryPicker;
-    if (!picker) { setError('Use Chrome or Edge on HTTPS to save a large backup directly to your PC.'); return; }
-    const abort = new AbortController(); controller.current = abort;
-    folderPickerOpen = true;
-    setBusy(true); setChoosingFolder(true); setError(''); setMessage('Choose a folder in the browser dialog. Check behind this window if the dialog is hidden.');
-    let folder: Folder;
-    try { folder = await picker.call(window, {mode: 'readwrite'}); }
-    catch (e) {
-      const failure = e as Error;
-      if (failure.name !== 'AbortError') setError(failure.name === 'InvalidStateError'
-        ? 'Another file or folder chooser is already open. Close it, then click Download data backup once.'
-        : failure.message);
-      setMessage(''); setBusy(false); controller.current = null;
-      return;
-    } finally {
-      folderPickerOpen = false;
-      setChoosingFolder(false);
-    }
-    if (abort.signal.aborted) { setBusy(false); setMessage(''); controller.current = null; return; }
-    setMessage('Preparing archive backup…');
-    let sessionId = '';
-    const request = async (path: string, method = 'GET') => {
-      const response = await fetch(`/api/backup${path}`, {method, cache: 'no-store', signal: abort.signal});
-      if (!response.ok) {
-        const text = await response.text(); let detail = `Backup request failed (${response.status})`;
-        try { detail = JSON.parse(text).detail || detail; } catch { /* non-JSON gateway error */ }
-        throw new Error(detail);
-      }
-      return response;
-    };
+  async function prepare() {
+    if (pending.current) return;
+    pending.current = true; setBusy(true); setError(''); setMessage('Starting server backup…');
     try {
-      const session = await (await request('', 'POST')).json(); sessionId = session.id;
-      const root = await folder.getDirectoryHandle('backtest-data-backup', {create: true});
-      const filesFolder = await root.getDirectoryHandle('files', {create: true});
-      const receipts = await root.getDirectoryHandle('receipts', {create: true});
-      // Only a fully completed download has a restore manifest.
-      await root.removeEntry('manifest.json').catch(e => { if (e.name !== 'NotFoundError') throw e; });
-      const coverage: WindowRow[] = []; const names: {instrument: string; symbol: string}[] = [];
-      for (let offset = 0; offset < Math.max(session.windows, session.name_count); offset += session.page_size) {
-        const page = await (await request(`/${sessionId}/manifest?offset=${offset}`)).json();
-        coverage.push(...page.coverage); names.push(...page.instrument_names);
-      }
-      const files: SavedFile[] = []; let transferred = 0; let completed = 0;
-      for (let index = 0; index < coverage.length; index++) {
-        if (!coverage[index].rows) continue;
-        abort.signal.throwIfAborted();
-        const key = coverage[index].object_key;
-        const filename = `${await hex(new TextEncoder().encode(key))}.parquet`;
-        let response = await request(`/${sessionId}/files/${index}?offset=0`);
-        const size = Number(response.headers.get('X-Backup-Size'));
-        const version = response.headers.get('X-Backup-Version') || '';
-        if (!Number.isSafeInteger(size) || size <= 0 || !version) throw new Error('Invalid backup file metadata');
-        let firstChunk = await response.arrayBuffer();
-        if (await hex(firstChunk) !== response.headers.get('X-Backup-SHA256')) throw new Error('Download checksum mismatch. Retry the backup.');
-        let saved: SavedFile | null = null;
-        try {
-          const receipt = JSON.parse(await (await (await receipts.getFileHandle(filename + '.json')).getFile()).text()) as SavedFile;
-          if (receipt.key === key && receipt.version === version && receipt.size === size && receipt.path === `files/${filename}` && receipt.chunks.length === Math.ceil(size / session.chunk_size)) {
-            const local = await (await filesFolder.getFileHandle(filename)).getFile();
-            let valid = local.size === size;
-            for (let part = 0; valid && part < receipt.chunks.length; part++) {
-              abort.signal.throwIfAborted();
-              valid = await hex(await local.slice(part * session.chunk_size, Math.min(size, (part + 1) * session.chunk_size)).arrayBuffer()) === receipt.chunks[part];
-            }
-            if (valid) saved = receipt;
-          }
-        } catch (e) { if (abort.signal.aborted) throw e; /* redownload missing or damaged files */ }
-        if (!saved) {
-          const output = await (await filesFolder.getFileHandle(filename, {create: true})).createWritable();
-          const hashes: string[] = [];
-          try {
-            for (let offset = 0; offset < size; offset += session.chunk_size) {
-              abort.signal.throwIfAborted();
-              if (offset) { response = await request(`/${sessionId}/files/${index}?offset=${offset}`); firstChunk = await response.arrayBuffer(); }
-              if (response.headers.get('X-Backup-Version') !== version || Number(response.headers.get('X-Backup-Size')) !== size) throw new Error('An archive file changed. Retry the backup.');
-              const hash = await hex(firstChunk);
-              if (firstChunk.byteLength !== Math.min(session.chunk_size, size - offset) || hash !== response.headers.get('X-Backup-SHA256')) throw new Error('Download checksum mismatch. Retry the backup.');
-              await output.write(firstChunk); hashes.push(hash); transferred += firstChunk.byteLength;
-              setMessage(`${completed} / ${session.files} files saved · ${(transferred / 1024 ** 3).toFixed(2)} GB downloaded. Keep this tab open.`);
-            }
-            await output.close();
-          } catch (e) { await output.abort().catch(() => {}); throw e; }
-          saved = {key, path: `files/${filename}`, size, version, chunks: hashes};
-          await writeJson(receipts, filename + '.json', saved);
-        }
-        files.push(saved); completed++;
-        setMessage(`${completed} / ${session.files} files saved or verified · ${(transferred / 1024 ** 3).toFixed(2)} GB downloaded.`);
-      }
-      await writeJson(root, 'manifest.json', {format: session.format, version: session.version,
-        created_at: session.created_at, chunk_size: session.chunk_size, coverage, instrument_names: names, files});
-      setMessage(`Backup complete: ${files.length} price files and the archive index saved in backtest-data-backup. Keep the entire folder together.`);
-    } catch (e) {
-      setError(abort.signal.aborted ? 'Backup cancelled. Download into the same parent folder to resume completed files.' : `${(e as Error).message} Download into the same parent folder to resume.`);
-      setMessage('');
-    } finally {
-      if (sessionId) await fetch(`/api/backup/${sessionId}`, {method: 'DELETE'}).catch(() => {});
-      controller.current = null; setBusy(false);
-    }
+      await request('', 'POST');
+      setMessage('Backup started on the server. You can close this page and return later to download it.');
+      await refresh();
+    } catch (e) { setError((e as Error).message); setMessage(''); }
+    finally { pending.current = false; setBusy(false); }
   }
+  async function remove(id: string) {
+    if (!window.confirm('Delete this generated backup ZIP from the server? Your stock price archive will remain available.')) return;
+    setBusy(true); setError('');
+    try { await request(`/${id}`, 'DELETE'); await refresh(); }
+    catch (e) { setError((e as Error).message); }
+    finally { setBusy(false); }
+  }
+
   return <section className="panel backup-panel">
-    <div><h2>Data backup</h2><p>Save all stocks and timeframes as compressed price files, with the archive index needed to restore them. Keep free disk space for the full archive.</p>
-      <p className="footnote">Use Chrome or Edge. Finish active jobs first. Imports, updates and deletions pause during download. To resume, choose the same parent folder. This backs up price data and symbol labels; API tokens and backtest history are excluded.</p></div>
-    <button className="primary" onClick={download} disabled={busy}>{choosingFolder ? 'Choose a folder…' : busy ? 'Backup in progress…' : 'Download data backup'}</button>
-    {busy && !choosingFolder && <button className="plain" onClick={() => controller.current?.abort()}>Cancel backup</button>}
+    <h2>Data backup</h2>
+    <p>Prepare a ZIP of all stocks, timeframes and the archive index on the server. When it is ready, use the download link to save it to your PC.</p>
+    <p className="footnote">Preparation continues if you close this page. Finish active jobs first. A local-volume backup needs additional free space about the size of your archive. API tokens and backtest history are excluded.</p>
+    <button className="primary" onClick={prepare} disabled={busy || loading || active}>{busy ? 'Please wait…' : active ? 'Preparing backup on server…' : 'Prepare data backup'}</button>
     {message && <p role="status" className="footnote">{message}</p>}
     {error && <p role="alert" className="alert danger">{error}</p>}
+    {loading && <p className="footnote">Loading server backups…</p>}
+    <div className="backup-list">{backups.map(item => <div className="backup-item" key={item.id}>
+      <div><strong>{new Date(item.created_at).toLocaleString()}</strong>
+        {['queued', 'running'].includes(item.status) ? <p role="status">{item.status === 'queued' ? 'Queued on server' : item.details?.stage === 'finalizing' ? 'Finalizing ZIP…' : `Preparing: ${item.progress.toLocaleString()} / ${item.total.toLocaleString()} files · ${size(item.details?.bytes || 0)} processed`}</p>
+          : item.status === 'complete' ? <p>Ready · {size(item.result?.size || 0)} · {item.result?.files.toLocaleString()} files</p>
+          : <p role="alert">Failed: {item.error || 'Please prepare a new backup.'}</p>}
+      </div>
+      {item.status === 'complete' && <div className="backup-item-actions">
+        <a href={`/api/backup/${encodeURIComponent(item.id)}/download`} target="_blank" rel="noreferrer">Download ZIP</a>
+        <button className="plain" onClick={() => remove(item.id)} disabled={busy}>Delete server backup</button>
+      </div>}
+    </div>)}</div>
+    <p className="footnote">Keep the downloaded ZIP for restoration. Download links are temporary; click Download ZIP again if a link expires. Delete old server backups after saving your copies to reclaim storage.</p>
   </section>;
 }
