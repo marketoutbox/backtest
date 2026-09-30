@@ -23,6 +23,7 @@ from cryptography.fernet import Fernet
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from backup import ArchiveBackup
 
 IST = ZoneInfo('Asia/Kolkata')
 INTERVALS = {'1m': ('minutes', 1, 28), '5m': ('minutes', 5, 28), '15m': ('minutes', 15, 28), '30m': ('minutes', 30, 85), '1h': ('hours', 1, 85), '1d': ('days', 1, 3000), '1w': ('weeks', 1, 8000), '1mo': ('months', 1, 8000)}
@@ -64,6 +65,9 @@ def archive_path(key):
 def auth(x_worker_secret: str | None = Header(None)):
     expected = os.environ.get('WORKER_SECRET')
     if not expected or x_worker_secret != expected: raise HTTPException(401, 'Unauthorized')
+
+archive_backup = ArchiveBackup(db, archive_path, storage, bucket)
+app.include_router(archive_backup.router(auth, lambda: submit('backup', {})))
 
 def validate_key(value: str):
     if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+|[A-Za-z0-9&_.-]{1,50}', value): raise ValueError('Enter an NSE ticker such as RELIANCE or an Upstox instrument key such as NSE_EQ|INE002A01018')
@@ -280,36 +284,44 @@ def available_tokens():
 def status():
     with db() as conn:
         rows = conn.execute('SELECT interval, count(DISTINCT instrument), sum(rows) FROM coverage GROUP BY interval').fetchall()
+        instrument_count = conn.execute('SELECT count(DISTINCT instrument) FROM coverage').fetchone()[0]
         running = conn.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
-    return {'archive': [{'interval': x, 'instruments': y, 'candles': z} for x,y,z in rows], 'active_jobs': running, 'intervals': list(INTERVALS)}
+    return {'archive': [{'interval': x, 'instruments': y, 'candles': z} for x,y,z in rows], 'active_jobs': running, 'instrument_count': instrument_count, 'intervals': list(INTERVALS)}
+
+@app.get('/instruments', dependencies=[Depends(auth)])
+def archived_instruments(search: str = Query('', max_length=100), limit: int = Query(50, ge=1, le=100)):
+    term = search.strip()
+    with db() as conn:
+        rows = conn.execute("""SELECT DISTINCT c.instrument,coalesce(n.symbol,c.instrument) AS symbol FROM coverage c LEFT JOIN instrument_names n ON n.instrument=c.instrument WHERE (strpos(lower(c.instrument),lower(%s))>0 OR strpos(lower(coalesce(n.symbol,'')),lower(%s))>0) ORDER BY symbol,c.instrument LIMIT %s""", (term,term,limit)).fetchall()
+    return {'instruments': [{'instrument': key, 'symbol': name} for key,name in rows]}
 
 @app.get('/symbols', dependencies=[Depends(auth)])
-def symbols():
+def symbols(search: str = Query('', max_length=100), interval: str | None = None,
+            instrument: str | None = Query(None, max_length=100),
+            limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+    if interval is not None and interval not in INTERVALS: raise HTTPException(400, 'Unknown interval')
+    conditions = []; params = []
+    if instrument:
+        conditions.append('c.instrument=%s'); params.append(instrument)
+    if interval:
+        conditions.append('c.interval=%s'); params.append(interval)
+    if search.strip():
+        term = search.strip()
+        conditions.append("""(strpos(lower(c.instrument),lower(%s))>0 OR strpos(lower(coalesce(n.symbol,'')),lower(%s))>0)"""); params.extend([term,term])
+    where = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
+    joined = ' FROM coverage c LEFT JOIN instrument_names n ON n.instrument=c.instrument' + where
     with db() as conn:
-        missing = conn.execute('SELECT DISTINCT c.instrument FROM coverage c LEFT JOIN instrument_names n ON n.instrument=c.instrument WHERE n.instrument IS NULL LIMIT 10').fetchall()
-        token_pool = available_tokens()
-        token = token_pool[0]['token'] if token_pool else None
-        if token and missing:
-            with httpx.Client(timeout=6) as client:
-                for (key,) in missing:
-                    if not key.startswith('NSE_EQ|'): continue
-                    try:
-                        response = client.get('https://api.upstox.com/v2/instruments/search',
-                            params={'query': key.split('|', 1)[1], 'exchanges': 'NSE', 'segments': 'EQ', 'records': 30},
-                            headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'})
-                        if response.status_code == 200:
-                            match = next((item for item in response.json().get('data', []) if str(item.get('instrument_key', '')).upper() == key.upper()), None)
-                            if match and match.get('trading_symbol'):
-                                conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (key, match['trading_symbol']))
-                    except (httpx.RequestError, ValueError): pass
-        rows = conn.execute('SELECT c.instrument, c.interval, min(c.from_date), max(c.to_date), sum(c.rows), count(*), n.symbol, min(c.first_candle), max(c.last_candle), count(*) FILTER (WHERE c.rows > 0), count(*) FILTER (WHERE c.rows > 0 AND c.first_candle IS NOT NULL) FROM coverage c LEFT JOIN instrument_names n ON n.instrument=c.instrument GROUP BY c.instrument,c.interval,n.symbol ORDER BY coalesce(n.symbol,c.instrument),c.interval').fetchall()
-    return {'symbols': [{'instrument': a, 'interval': b, 'from_date': str(c), 'to_date': str(d), 'candles': e, 'windows': w, 'symbol': name or a, 'first_candle': str(first) if first else None, 'last_candle': str(last) if last else None, 'filled_windows': filled, 'verified_windows': verified} for a,b,c,d,e,w,name,first,last,filled,verified in rows]}
+        total = conn.execute('SELECT count(*) FROM (SELECT c.instrument,c.interval' + joined + ' GROUP BY c.instrument,c.interval) grouped', params).fetchone()[0]
+        page_keys = 'SELECT c.instrument,c.interval,n.symbol' + joined + ' GROUP BY c.instrument,c.interval,n.symbol ORDER BY coalesce(n.symbol,c.instrument),c.instrument,c.interval LIMIT %s OFFSET %s'
+        rows = conn.execute('WITH page_keys AS (' + page_keys + ') SELECT c.instrument,c.interval,min(c.from_date),max(c.to_date),sum(c.rows),count(*),p.symbol,min(c.first_candle),max(c.last_candle),count(*) FILTER (WHERE c.rows>0),count(*) FILTER (WHERE c.rows>0 AND c.first_candle IS NOT NULL) FROM page_keys p JOIN coverage c ON c.instrument=p.instrument AND c.interval=p.interval GROUP BY c.instrument,c.interval,p.symbol ORDER BY coalesce(p.symbol,c.instrument),c.instrument,c.interval', [*params,limit,offset]).fetchall()
+    return {'symbols': [{'instrument': a, 'interval': b, 'from_date': str(c), 'to_date': str(d), 'candles': e, 'windows': w, 'symbol': name or a, 'first_candle': str(first) if first else None, 'last_candle': str(last) if last else None, 'filled_windows': filled, 'verified_windows': verified} for a,b,c,d,e,w,name,first,last,filled,verified in rows], 'total': total, 'limit': limit, 'offset': offset}
 
 class InstrumentLabel(BaseModel):
     instrument: str
     symbol: str
 
 @app.post('/instrument/label', dependencies=[Depends(auth)])
+@archive_backup.mutation
 def set_instrument_label(body: InstrumentLabel):
     symbol = body.symbol.strip().upper()
     if not re.fullmatch(r'[A-Z0-9&_.-]{1,50}', symbol): raise HTTPException(400, 'Enter a valid ticker name')
@@ -319,6 +331,7 @@ def set_instrument_label(body: InstrumentLabel):
         conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (body.instrument, symbol))
     return {'instrument': body.instrument, 'symbol': symbol}
 
+@archive_backup.mutation
 def submit(kind, payload):
     job_id = str(uuid.uuid4())
     with db() as conn:
@@ -373,6 +386,7 @@ def job(job_id: str):
     return dict(zip(('id','kind','status','progress','total','result','error','details'), row))
 
 @app.post('/jobs/{job_id}/resume', dependencies=[Depends(auth)])
+@archive_backup.mutation
 def resume_job(job_id: str):
     with db() as conn:
         row = conn.execute("UPDATE jobs SET status='queued',error=NULL,updated_at=now() WHERE id=%s AND kind='backfill' AND status IN ('failed','partial') RETURNING id", (job_id,)).fetchone()
@@ -393,7 +407,12 @@ async def run_queue():
             with db() as conn:
                 kind, payload = conn.execute('SELECT kind,payload FROM jobs WHERE id=%s', (job_id,)).fetchone()
             update(job_id, status='running', error=None)
-            result = await ingest(job_id, payload) if kind == 'backfill' else await asyncio.to_thread(run_backtest, job_id, payload)
+            if kind == 'backfill':
+                result = await ingest(job_id, payload)
+            elif kind == 'backup':
+                result = await asyncio.to_thread(archive_backup.build, job_id, update)
+            else:
+                result = await asyncio.to_thread(run_backtest, job_id, payload)
             update(job_id, status='partial' if result.get('failed_symbols') else 'complete', result=result)
         except asyncio.CancelledError:
             raise
@@ -611,6 +630,7 @@ class DeleteArchive(BaseModel):
     instrument: str
 
 @app.post('/archive/delete', dependencies=[Depends(auth)])
+@archive_backup.mutation
 def delete_archive(body: DeleteArchive):
     if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+', body.instrument): raise HTTPException(400, 'Select an archived instrument')
     with db() as conn:
@@ -741,3 +761,4 @@ def run_backtest(job_id, payload):
         update(job_id,progress=i+1)
     wins=[t for t in trades if t['pnl']>0]
     return {'summary':{'trades':len(trades),'wins':len(wins),'win_rate':round(100*len(wins)/len(trades),2) if trades else 0,'net_pnl':round(sum(t['pnl'] for t in trades),2),'largest_win':max((t['pnl'] for t in trades),default=0),'largest_loss':min((t['pnl'] for t in trades),default=0)},'missing_instruments':missing,'trades':trades}
+
