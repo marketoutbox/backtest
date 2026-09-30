@@ -17,8 +17,12 @@ async function writeJson(folder: Folder, name: string, value: unknown) {
   catch (error) { await stream.abort().catch(() => {}); throw error; }
 }
 
+// A native picker can outlive a component unmount (for example, a tab change).
+let folderPickerOpen = false;
+
 export default function DataBackup() {
   const [busy, setBusy] = useState(false);
+  const [choosingFolder, setChoosingFolder] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const controller = useRef<AbortController | null>(null);
@@ -32,13 +36,32 @@ export default function DataBackup() {
   }, [busy]);
 
   async function download() {
+    // The ref guards synchronous/repeated clicks before React renders disabled.
+    if (controller.current) return;
+    if (folderPickerOpen) {
+      setError('A folder chooser is already open. Finish or close that dialog, then try again.');
+      return;
+    }
     const picker = (window as unknown as {showDirectoryPicker?: (options: {mode: string}) => Promise<Folder>}).showDirectoryPicker;
     if (!picker) { setError('Use Chrome or Edge on HTTPS to save a large backup directly to your PC.'); return; }
+    const abort = new AbortController(); controller.current = abort;
+    folderPickerOpen = true;
+    setBusy(true); setChoosingFolder(true); setError(''); setMessage('Choose a folder in the browser dialog. Check behind this window if the dialog is hidden.');
     let folder: Folder;
     try { folder = await picker.call(window, {mode: 'readwrite'}); }
-    catch (e) { if ((e as Error).name !== 'AbortError') setError((e as Error).message); return; }
-    const abort = new AbortController(); controller.current = abort;
-    setBusy(true); setError(''); setMessage('Preparing archive backup…');
+    catch (e) {
+      const failure = e as Error;
+      if (failure.name !== 'AbortError') setError(failure.name === 'InvalidStateError'
+        ? 'Another file or folder chooser is already open. Close it, then click Download data backup once.'
+        : failure.message);
+      setMessage(''); setBusy(false); controller.current = null;
+      return;
+    } finally {
+      folderPickerOpen = false;
+      setChoosingFolder(false);
+    }
+    if (abort.signal.aborted) { setBusy(false); setMessage(''); controller.current = null; return; }
+    setMessage('Preparing archive backup…');
     let sessionId = '';
     const request = async (path: string, method = 'GET') => {
       const response = await fetch(`/api/backup${path}`, {method, cache: 'no-store', signal: abort.signal});
@@ -121,8 +144,8 @@ export default function DataBackup() {
   return <section className="panel backup-panel">
     <div><h2>Data backup</h2><p>Save all stocks and timeframes as compressed price files, with the archive index needed to restore them. Keep free disk space for the full archive.</p>
       <p className="footnote">Use Chrome or Edge. Finish active jobs first. Imports, updates and deletions pause during download. To resume, choose the same parent folder. This backs up price data and symbol labels; API tokens and backtest history are excluded.</p></div>
-    <button className="primary" onClick={download} disabled={busy}>Download data backup</button>
-    {busy && <button className="plain" onClick={() => controller.current?.abort()}>Cancel backup</button>}
+    <button className="primary" onClick={download} disabled={busy}>{choosingFolder ? 'Choose a folder…' : busy ? 'Backup in progress…' : 'Download data backup'}</button>
+    {busy && !choosingFolder && <button className="plain" onClick={() => controller.current?.abort()}>Cancel backup</button>}
     {message && <p role="status" className="footnote">{message}</p>}
     {error && <p role="alert" className="alert danger">{error}</p>}
   </section>;
