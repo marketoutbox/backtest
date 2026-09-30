@@ -23,6 +23,7 @@ from cryptography.fernet import Fernet
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from backup import ArchiveBackup
 
 IST = ZoneInfo('Asia/Kolkata')
 INTERVALS = {'1m': ('minutes', 1, 28), '5m': ('minutes', 5, 28), '15m': ('minutes', 15, 28), '30m': ('minutes', 30, 85), '1h': ('hours', 1, 85), '1d': ('days', 1, 3000), '1w': ('weeks', 1, 8000), '1mo': ('months', 1, 8000)}
@@ -64,6 +65,9 @@ def archive_path(key):
 def auth(x_worker_secret: str | None = Header(None)):
     expected = os.environ.get('WORKER_SECRET')
     if not expected or x_worker_secret != expected: raise HTTPException(401, 'Unauthorized')
+
+archive_backup = ArchiveBackup(db, archive_path, storage, bucket)
+app.include_router(archive_backup.router(auth))
 
 def validate_key(value: str):
     if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+|[A-Za-z0-9&_.-]{1,50}', value): raise ValueError('Enter an NSE ticker such as RELIANCE or an Upstox instrument key such as NSE_EQ|INE002A01018')
@@ -310,6 +314,7 @@ class InstrumentLabel(BaseModel):
     symbol: str
 
 @app.post('/instrument/label', dependencies=[Depends(auth)])
+@archive_backup.mutation
 def set_instrument_label(body: InstrumentLabel):
     symbol = body.symbol.strip().upper()
     if not re.fullmatch(r'[A-Z0-9&_.-]{1,50}', symbol): raise HTTPException(400, 'Enter a valid ticker name')
@@ -319,6 +324,7 @@ def set_instrument_label(body: InstrumentLabel):
         conn.execute('INSERT INTO instrument_names (instrument,symbol) VALUES (%s,%s) ON CONFLICT (instrument) DO UPDATE SET symbol=excluded.symbol', (body.instrument, symbol))
     return {'instrument': body.instrument, 'symbol': symbol}
 
+@archive_backup.mutation
 def submit(kind, payload):
     job_id = str(uuid.uuid4())
     with db() as conn:
@@ -373,6 +379,7 @@ def job(job_id: str):
     return dict(zip(('id','kind','status','progress','total','result','error','details'), row))
 
 @app.post('/jobs/{job_id}/resume', dependencies=[Depends(auth)])
+@archive_backup.mutation
 def resume_job(job_id: str):
     with db() as conn:
         row = conn.execute("UPDATE jobs SET status='queued',error=NULL,updated_at=now() WHERE id=%s AND kind='backfill' AND status IN ('failed','partial') RETURNING id", (job_id,)).fetchone()
@@ -611,6 +618,7 @@ class DeleteArchive(BaseModel):
     instrument: str
 
 @app.post('/archive/delete', dependencies=[Depends(auth)])
+@archive_backup.mutation
 def delete_archive(body: DeleteArchive):
     if not re.fullmatch(r'[A-Z0-9_]+\|[A-Za-z0-9 ._-]+', body.instrument): raise HTTPException(400, 'Select an archived instrument')
     with db() as conn:
@@ -741,3 +749,4 @@ def run_backtest(job_id, payload):
         update(job_id,progress=i+1)
     wins=[t for t in trades if t['pnl']>0]
     return {'summary':{'trades':len(trades),'wins':len(wins),'win_rate':round(100*len(wins)/len(trades),2) if trades else 0,'net_pnl':round(sum(t['pnl'] for t in trades),2),'largest_win':max((t['pnl'] for t in trades),default=0),'largest_loss':min((t['pnl'] for t in trades),default=0)},'missing_instruments':missing,'trades':trades}
+
